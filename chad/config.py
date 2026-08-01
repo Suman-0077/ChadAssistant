@@ -1,0 +1,55 @@
+"""Configuration for Chad.
+
+Loads settings from environment variables (via a .env file) and validates
+them once at import time. If anything required is missing, we crash
+immediately with a clear message — a config error should never be
+discovered halfway through a conversation.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Read the .env file sitting in the project root (the directory you run
+# `python -m chad.bot` from). Existing real environment variables win over
+# .env values, which is standard behaviour.
+load_dotenv()
+
+
+def _require(name: str) -> str:
+    """Fetch a required environment variable or exit with a clear error."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        sys.exit(f"Config error: required environment variable {name} is not set. "
+                 f"Copy .env.example to .env and fill it in.")
+    return value
+
+
+# --- Secrets and identifiers -------------------------------------------------
+
+ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
+TELEGRAM_BOT_TOKEN = _require("TELEGRAM_BOT_TOKEN")
+
+# The ONLY Telegram user Chad will talk to. Everything else is ignored.
+try:
+    ALLOWED_TELEGRAM_ID = int(_require("ALLOWED_TELEGRAM_ID"))
+except ValueError:
+    sys.exit("Config error: ALLOWED_TELEGRAM_ID must be a number "
+             "(your numeric Telegram user ID, not your @username).")
+
+# --- Vault -------------------------------------------------------------------
+
+# resolve() turns the path into an absolute, symlink-free form. vault.py
+# depends on this for its path-jail check, so we do it here, once.
+VAULT_PATH = Path(_require("VAULT_PATH")).resolve()
+
+if not VAULT_PATH.is_dir():
+    sys.exit(f"Config error: VAULT_PATH does not exist or is not a directory: "
+             f"{VAULT_PATH}")
+
+# --- Model -------------------------------------------------------------------
+
+# Optional, with a sensible default. Override in .env to try other models.
+MODEL = os.environ.get("MODEL", "claude-sonnet-4-5").strip()
