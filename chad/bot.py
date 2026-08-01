@@ -17,6 +17,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 from chad import config, brain
+from chad.history import HistoryStore
 
 logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -24,10 +25,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("chad.bot")
 
-# One conversation history per chat, keyed by Telegram chat ID.
-# For now there's only one allowed user, but the structure is ready
-# for the day (if ever) that changes.
-_histories: dict[int, list[dict]] = {}
+# Persistent conversation history. Backed by a JSON file so a systemd
+# restart doesn't wipe what Chad remembers of the current conversation
+# (and, once M2 lands, doesn't orphan pending approvals).
+_history = HistoryStore(config.HISTORY_PATH)
 
 
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -45,7 +46,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     log.info("Message from allowed user: %s", text[:80])
 
     chat_id = update.effective_chat.id
-    history = _histories.setdefault(chat_id, [])
+    history = _history.get(chat_id)
 
     # brain.think() is synchronous (network I/O to Anthropic). Running
     # it inside the async handler like this blocks the event loop, which
@@ -53,6 +54,10 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # ever needed concurrency we'd push this into a thread or use the
     # async Anthropic client.
     reply = brain.think(history, text)
+
+    # Persist the mutated history (brain.think appends in place). Trim
+    # + atomic-write is HistoryStore's job.
+    _history.set(chat_id, history)
 
     await update.message.reply_text(reply)
 

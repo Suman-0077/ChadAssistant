@@ -49,6 +49,18 @@ if not VAULT_PATH.is_dir():
     sys.exit(f"Config error: VAULT_PATH does not exist or is not a directory: "
              f"{VAULT_PATH}")
 
+# --- State (history, pending approvals, audit log) --------------------------
+
+# Persistent state that isn't part of the human-visible vault lives in a
+# hidden sibling folder. Kept inside the vault so backups/git cover it, but
+# dot-prefixed so Obsidian and list_notes ignore it.
+STATE_DIR = Path(
+    os.environ.get("STATE_DIR", str(VAULT_PATH / ".chad-state"))
+).resolve()
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+HISTORY_PATH = STATE_DIR / "history.json"
+
 # --- Model -------------------------------------------------------------------
 
 # Optional, with a sensible default. Override in .env to try other models.
