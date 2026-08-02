@@ -59,7 +59,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # + atomic-write is HistoryStore's job.
     _history.set(chat_id, history)
 
-   await update.message.reply_text(reply) 
+    await update.message.reply_text(reply)
 
 
 def main() -> None:
