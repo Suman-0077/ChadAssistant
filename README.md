@@ -21,9 +21,19 @@ Telegram → bot.py → brain.py → vault.py → Obsidian vault (folder of .md 
 
 Each layer only knows about the one below it.
 
+## Tools currently exposed
+
+- `list_notes(folder?)` — list markdown notes in the vault (or a subtree)
+- `read_note(note_name)` — read one note
+- `append_note(note_name, text)` — append to an existing note
+- `create_note(note_name, text)` — create a new note
+- `append_to_inbox(text)` — append to today's inbox/YYYY-MM-DD.md
+- `edit_section(note_name, section_heading, new_body)` — replace one section body
+- `update_memory(section, new_body)` — guarded write to memory.md (schema + token cap enforced)
+
 ## Roadmap (future tools)
 
 - `read_document` — extract text from PDFs, docx, pptx inside the vault
 - `search_notes` — grep across notes by keyword
 - `resolve_link` / `backlinks` — follow and discover Obsidian [[wikilinks]]
-- `edit_section` — targeted in-place editing (not just append)
+- `consolidate_memory` — rewrite memory.md, archive stale content

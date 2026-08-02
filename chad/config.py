@@ -9,6 +9,7 @@ discovered halfway through a conversation.
 import os
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -60,6 +61,19 @@ STATE_DIR = Path(
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_PATH = STATE_DIR / "history.json"
+
+# --- Time --------------------------------------------------------------------
+
+# The server runs in UTC but the user lives in a real timezone. Anything Chad
+# reasons about — "today", "tomorrow", "yesterday's roster" — has to be in the
+# user's local time. Defaults to UTC so bad config is obvious rather than
+# subtly wrong.
+_tz_name = os.environ.get("USER_TIMEZONE", "UTC").strip()
+try:
+    USER_TIMEZONE = ZoneInfo(_tz_name)
+except ZoneInfoNotFoundError:
+    sys.exit(f"Config error: USER_TIMEZONE '{_tz_name}' is not a valid IANA "
+             f"timezone (try 'Australia/Sydney', 'Europe/London', etc.).")
 
 # --- Model -------------------------------------------------------------------
 

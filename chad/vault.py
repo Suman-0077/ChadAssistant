@@ -21,6 +21,14 @@ from pathlib import Path
 from chad import config
 
 
+# Notes that MUST go through their own guarded write path. General-purpose
+# write tools (append_note, create_note, edit_section) all refuse these —
+# so the schema and cap checks on memory.md cannot be bypassed by picking
+# a different tool. Add to this set as more protected notes appear
+# (map.md at Rung 3, reminders.md if it gets structured).
+_PROTECTED_NOTES = frozenset({"memory.md"})
+
+
 class VaultError(Exception):
     """Raised for any invalid or unsafe vault operation.
 
@@ -49,6 +57,21 @@ def _safe_path(note_name: str) -> Path:
         raise VaultError("Only .md files are allowed in the vault.")
 
     return candidate
+
+
+def _assert_writable(note_name: str, tool_name: str) -> None:
+    """Refuse writes to notes with dedicated guarded write paths.
+
+    Every user-facing mutating tool (append_note, create_note, edit_section)
+    calls this. The internal write_note_raw does NOT — it's the escape hatch
+    that guarded writers (memory.write_section) use to actually put bytes on
+    disk after their own checks.
+    """
+    if note_name.strip() in _PROTECTED_NOTES:
+        raise VaultError(
+            f"{note_name} is a protected note and cannot be modified via "
+            f"{tool_name}. Use its dedicated tool (update_memory for memory.md)."
+        )
 
 
 def _safe_dir(folder: str) -> Path:
@@ -89,6 +112,7 @@ def read_note(note_name: str) -> str:
 
 def append_note(note_name: str, text: str) -> str:
     """Append text to the end of an existing note. Never overwrites."""
+    _assert_writable(note_name, "append_note")
     path = _safe_path(note_name)
     if not path.is_file():
         raise VaultError(f"Note not found: {note_name}. Use create_note for new notes.")
@@ -100,6 +124,7 @@ def append_note(note_name: str, text: str) -> str:
 
 def create_note(note_name: str, text: str) -> str:
     """Create a new note. Refuses if the note already exists."""
+    _assert_writable(note_name, "create_note")
     path = _safe_path(note_name)
     if path.exists():
         raise VaultError(f"Note already exists: {note_name}. Use append_note instead.")
@@ -110,6 +135,26 @@ def create_note(note_name: str, text: str) -> str:
     with path.open("x", encoding="utf-8") as f:
         f.write(text.rstrip() + "\n")
     return f"Created {note_name}."
+
+
+def append_to_inbox(text: str) -> str:
+    """Append `text` to today's inbox note (inbox/YYYY-MM-DD.md).
+
+    Computes today's date server-side in the user's timezone, so Chad
+    doesn't have to know the date and can't drift onto the wrong day.
+    Creates the note if it doesn't exist yet. Never touches other notes.
+    """
+    today = datetime.now(config.USER_TIMEZONE).date().isoformat()
+    note_name = f"inbox/{today}.md"
+    path = _safe_path(note_name)
+    if path.is_file():
+        with path.open("a", encoding="utf-8") as f:
+            f.write("\n" + text.rstrip() + "\n")
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as f:
+            f.write(text.rstrip() + "\n")
+    return f"Added to {note_name}."
 
 
 # --- Section editing --------------------------------------------------------
@@ -181,12 +226,6 @@ def compute_section_edit(text: str, section_heading: str, new_body: str) -> str:
     return "\n".join(before + [""] + new_body_lines + [""] + after).rstrip() + "\n"
 
 
-# memory.md is special — always route through memory.write_section so the
-# schema-and-cap check runs. This late import breaks a circular import
-# (memory imports vault); do it lazily inside the guard function.
-_MEMORY_FILENAME = "memory.md"
-
-
 def edit_section(note_name: str, section_heading: str, new_body: str) -> str:
     """Replace the body under a markdown heading with new_body.
 
@@ -195,16 +234,11 @@ def edit_section(note_name: str, section_heading: str, new_body: str) -> str:
     end of the file. The heading line itself is preserved — only the
     body between it and the next section boundary is replaced.
 
-    Fails if the heading is missing or ambiguous. Refuses to edit
-    memory.md — that file has its own guarded write path (memory.write_section)
-    with schema and token-cap enforcement.
+    Fails if the heading is missing or ambiguous. Refuses protected notes
+    (memory.md) via _assert_writable — those have their own guarded write
+    paths that enforce schema and token caps.
     """
-    if note_name.strip() == _MEMORY_FILENAME:
-        raise VaultError(
-            "memory.md must be edited via update_memory, not edit_section. "
-            "The dedicated tool enforces the fixed section schema and the "
-            "token cap."
-        )
+    _assert_writable(note_name, "edit_section")
 
     path = _safe_path(note_name)
     if not path.is_file():
