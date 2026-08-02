@@ -15,7 +15,7 @@ a tool has consequences outside the vault.
 
 import anthropic
 
-from chad import config, vault
+from chad import config, memory, vault
 
 BASE_SYSTEM_PROMPT = """You are Chad, a personal assistant for your user, \
 whom you talk to over Telegram. Your memory is an Obsidian vault of markdown \
@@ -43,10 +43,13 @@ MEMORY:
 Your persistent memory lives in memory.md and is included below every \
 request. Treat it as authoritative — it's how you remember things across \
 conversations. When the user tells you something worth keeping ("call me \
-X", "roster comes Y", "I prefer Z"), use edit_section to update the right \
-part of memory.md. Keep it short: distilled conclusions, not transcripts. \
-When the user contradicts or updates something in memory.md, edit it — \
-don't just append.
+X", "roster comes Y", "I prefer Z"), use the update_memory tool (NOT \
+edit_section — memory.md refuses that path). Choose the correct fixed \
+section for the fact: Identity for stable facts (name, program, employer, \
+location), Preferences for how you should behave, Ongoing for current \
+courses / projects / shifts, Decisions for conclusions with dates, \
+Archive for pointers to older material. When the user contradicts \
+memory, update the section — do not stack duplicates.
 """
 
 
@@ -135,12 +138,11 @@ TOOLS = [
     {
         "name": "edit_section",
         "description": "Replace the body under a specific markdown heading "
-                       "in an existing note. Use this to UPDATE memory.md "
-                       "when the user tells you a preference or fact that "
-                       "supersedes something already there. The section is "
-                       "identified by its heading text (without the # marks). "
-                       "Fails if the heading doesn't exist or appears more "
-                       "than once.",
+                       "in an existing note. General-purpose section editing "
+                       "for any note EXCEPT memory.md (which has its own "
+                       "tool: update_memory). The section is identified by "
+                       "its heading text (without the # marks). Fails if the "
+                       "heading doesn't exist or appears more than once.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -151,6 +153,36 @@ TOOLS = [
                              "description": "The new content that replaces the section body. Do NOT include the heading itself."},
             },
             "required": ["note_name", "section_heading", "new_body"],
+        },
+    },
+    {
+        "name": "update_memory",
+        "description": "Update a section of memory.md — the persistent "
+                       "memory that's injected into your system prompt every "
+                       "request. The ONLY way to modify memory.md. Section "
+                       "must be one of: Identity, Preferences, Ongoing, "
+                       "Decisions, Archive. new_body REPLACES the entire "
+                       "section body; if you want to add without discarding, "
+                       "include the existing content in new_body. Refuses "
+                       "the write if memory.md would exceed its token cap — "
+                       "if that happens, tell the user consolidation is needed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "enum": ["Identity", "Preferences", "Ongoing",
+                             "Decisions", "Archive"],
+                    "description": "One of the five fixed memory sections.",
+                },
+                "new_body": {
+                    "type": "string",
+                    "description": "Replacement body for the section. Do NOT "
+                                   "include the '## Section' heading — just "
+                                   "the content that goes under it.",
+                },
+            },
+            "required": ["section", "new_body"],
         },
     },
 ]
@@ -174,9 +206,15 @@ def _run_tool(name: str, args: dict) -> str:
             return vault.edit_section(
                 args["note_name"], args["section_heading"], args["new_body"],
             )
+        if name == "update_memory":
+            return memory.write_section(args["section"], args["new_body"])
         return f"Unknown tool: {name}"
     except vault.VaultError as e:
         return f"Error: {e}"
+    except memory.CapExceeded as e:
+        # Distinct from generic errors — the model should tell the user
+        # consolidation is needed, not just retry.
+        return f"CAP_EXCEEDED: {e}"
 
 
 def think(history: list[dict], user_message: str) -> str:

@@ -16,7 +16,7 @@ import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-from chad import config, brain
+from chad import config, brain, memory
 from chad.history import HistoryStore
 
 logging.basicConfig(
@@ -59,11 +59,15 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # + atomic-write is HistoryStore's job.
     _history.set(chat_id, history)
 
-    await update.message.reply_text(reply)
+   await update.message.reply_text(reply) 
 
 
 def main() -> None:
     """Start polling Telegram for messages."""
+    # Ensure memory.md exists with the fixed schema before Chad accepts any
+    # message. A fresh vault should not need a separate bootstrap step.
+    memory.ensure_exists()
+
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
     log.info("Chad is online. Listening for messages...")

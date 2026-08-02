@@ -133,23 +133,18 @@ def _backup(path: Path) -> None:
     backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def edit_section(note_name: str, section_heading: str, new_body: str) -> str:
-    """Replace the body under a markdown heading with new_body.
+def compute_section_edit(text: str, section_heading: str, new_body: str) -> str:
+    """Pure function: return what `text` would become after editing a section.
 
-    A section is delimited by its heading line (e.g. "## Preferences")
-    and runs until the next heading at the same or higher level, or the
-    end of the file. The heading line itself is preserved — only the
-    body between it and the next section boundary is replaced.
+    Split out so callers (memory.write_section) can check the resulting
+    size against a cap BEFORE the edit is committed to disk. Used by
+    edit_section internally too.
 
-    Fails if the heading is missing, or if it appears more than once
-    (ambiguous). In the ambiguous case the caller should rewrite the
-    note so headings are unique, or use a different tool.
+    Raises VaultError with the same conditions as edit_section:
+      - Heading missing.
+      - Heading ambiguous (appears more than once at any level).
     """
-    path = _safe_path(note_name)
-    if not path.is_file():
-        raise VaultError(f"Note not found: {note_name}")
-
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = text.splitlines()
 
     # Locate every heading in the file, with its position and level.
     headings = []
@@ -161,11 +156,11 @@ def edit_section(note_name: str, section_heading: str, new_body: str) -> str:
     target = section_heading.strip()
     matches = [h for h in headings if h[2] == target]
     if not matches:
-        raise VaultError(f"Section '{section_heading}' not found in {note_name}.")
+        raise VaultError(f"Section '{section_heading}' not found.")
     if len(matches) > 1:
         raise VaultError(
-            f"Section '{section_heading}' appears more than once in "
-            f"{note_name}. Rewrite the note so headings are unique."
+            f"Section '{section_heading}' appears more than once. "
+            f"Rewrite the note so headings are unique."
         )
 
     start, level, _ = matches[0]
@@ -177,15 +172,58 @@ def edit_section(note_name: str, section_heading: str, new_body: str) -> str:
             end = i
             break
 
-    _backup(path)
-
     before = lines[: start + 1]              # up to and including the heading
     after = lines[end:]                       # from the next section onward
     new_body_lines = new_body.rstrip().splitlines()
 
     # Sandwich the new body between the heading and the next section,
     # padded with one blank line on each side for readability.
-    rebuilt = "\n".join(before + [""] + new_body_lines + [""] + after).rstrip() + "\n"
-    path.write_text(rebuilt, encoding="utf-8")
+    return "\n".join(before + [""] + new_body_lines + [""] + after).rstrip() + "\n"
 
+
+# memory.md is special — always route through memory.write_section so the
+# schema-and-cap check runs. This late import breaks a circular import
+# (memory imports vault); do it lazily inside the guard function.
+_MEMORY_FILENAME = "memory.md"
+
+
+def edit_section(note_name: str, section_heading: str, new_body: str) -> str:
+    """Replace the body under a markdown heading with new_body.
+
+    A section is delimited by its heading line (e.g. "## Preferences")
+    and runs until the next heading at the same or higher level, or the
+    end of the file. The heading line itself is preserved — only the
+    body between it and the next section boundary is replaced.
+
+    Fails if the heading is missing or ambiguous. Refuses to edit
+    memory.md — that file has its own guarded write path (memory.write_section)
+    with schema and token-cap enforcement.
+    """
+    if note_name.strip() == _MEMORY_FILENAME:
+        raise VaultError(
+            "memory.md must be edited via update_memory, not edit_section. "
+            "The dedicated tool enforces the fixed section schema and the "
+            "token cap."
+        )
+
+    path = _safe_path(note_name)
+    if not path.is_file():
+        raise VaultError(f"Note not found: {note_name}")
+
+    text = path.read_text(encoding="utf-8")
+    new_content = compute_section_edit(text, section_heading, new_body)
+
+    _backup(path)
+    path.write_text(new_content, encoding="utf-8")
     return f"Edited section '{section_heading}' in {note_name}. Backup saved."
+
+
+def write_note_raw(note_name: str, new_content: str) -> None:
+    """Write raw content to a note, with backup. Intended for memory.write_section
+    which has already computed and validated the content. Not exposed as a tool
+    — general callers should use append_note, create_note, or edit_section."""
+    path = _safe_path(note_name)
+    if path.is_file():
+        _backup(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new_content, encoding="utf-8")
