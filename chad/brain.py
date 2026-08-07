@@ -10,8 +10,10 @@ Flow for one user message:
 
 Step 2-4 is "the agent loop". Two families of tools:
 
-  * Read-only-ish (list, read, append, create, edit_section, update_memory,
+  * Read-only-ish (list, read, append, create, edit_section,
     append_to_inbox): touch only Chad's own vault. Run inline.
+    NOTE: memory.md is NOT writable by Chad — the post-turn extractor
+    (chad/extractor.py) is its sole writer.
   * Side-effecting (add_reminder and everything future): NEVER run
     inline. Chad calls propose_action(kind, args); the proposal queues;
     the callback in bot.py fires the executor after the human approves
@@ -57,14 +59,18 @@ the user's knowledge graph.
 MEMORY:
 Your persistent memory lives in memory.md and is included below every \
 request. Treat it as authoritative — it's how you remember things across \
-conversations. When the user tells you something worth keeping ("call me \
-X", "roster comes Y", "I prefer Z"), use the update_memory tool (NOT \
-edit_section — memory.md refuses that path). Choose the correct fixed \
-section for the fact: Identity for stable facts (name, program, employer, \
-location), Preferences for how you should behave, Ongoing for current \
-courses / projects / shifts, Decisions for conclusions with dates, \
-Archive for pointers to older material. When the user contradicts \
-memory, update the section — do not stack duplicates.
+conversations.
+You do NOT write to memory.md. A separate process reads each exchange \
+after you reply and records anything durable automatically. So:
+- Never claim you have "saved" or "noted" something to memory — you \
+didn't, and you can't verify it landed.
+- If the user says "remember X", acknowledge naturally ("got it") \
+without describing a save operation. The recording happens on its own.
+- If the user asks what you remember, read what's in memory.md below \
+and answer from that.
+- If the user wants something REMOVED from memory, tell them memory is \
+maintained automatically and they can edit memory.md directly in their \
+vault — you have no delete capability.
 
 APPROVALS:
 You NEVER execute a side-effecting action directly. Any action that \
@@ -198,8 +204,8 @@ TOOLS = [
         "name": "edit_section",
         "description": "Replace the body under a specific markdown heading "
                        "in an existing note. General-purpose section editing "
-                       "for any note EXCEPT memory.md (which has its own "
-                       "tool: update_memory). The section is identified by "
+                       "for any note EXCEPT memory.md (which you cannot "
+                       "write to at all). The section is identified by "
                        "its heading text (without the # marks). Fails if the "
                        "heading doesn't exist or appears more than once.",
         "input_schema": {
@@ -260,37 +266,14 @@ TOOLS = [
             "required": ["kind", "args"],
         },
     },
-    {
-        "name": "update_memory",
-        "description": "Update a section of memory.md — the persistent "
-                       "memory that's injected into your system prompt every "
-                       "request. The ONLY way to modify memory.md. Section "
-                       "must be one of: Identity, Preferences, Ongoing, "
-                       "Decisions, Archive. new_body REPLACES the entire "
-                       "section body; if you want to add without discarding, "
-                       "include the existing content in new_body. Refuses "
-                       "the write if memory.md would exceed its token cap — "
-                       "if that happens, tell the user consolidation is needed.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "section": {
-                    "type": "string",
-                    "enum": ["Identity", "Preferences", "Ongoing",
-                             "Decisions", "Archive"],
-                    "description": "One of the five fixed memory sections.",
-                },
-                "new_body": {
-                    "type": "string",
-                    "description": "Replacement body for the section. Do NOT "
-                                   "include the '## Section' heading — just "
-                                   "the content that goes under it.",
-                },
-            },
-            "required": ["section", "new_body"],
-        },
-    },
 ]
+# NOTE: update_memory was deliberately removed. Having both Chad's inline
+# tool AND the post-turn extractor writing to memory.md produced duplicate
+# facts in different phrasings ("Studying at USYD" / "User studies at USYD
+# (University of Sydney)."), which line-based dedupe cannot catch. The
+# design doc §3.2 already said the extractor is where the weight should
+# go; this makes it the sole writer. memory.write_section stays available
+# to the extractor and to future consolidation (M9), just not to Chad.
 
 _client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -317,8 +300,6 @@ def _run_tool(name: str, args: dict, chat_id: int) -> str:
             return vault.edit_section(
                 args["note_name"], args["section_heading"], args["new_body"],
             )
-        if name == "update_memory":
-            return memory.write_section(args["section"], args["new_body"])
         if name == "propose_action":
             # Validation and summary derivation happen inside .add(); a
             # bad args dict raises here and the human never sees a

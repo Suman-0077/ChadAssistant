@@ -83,8 +83,10 @@ def _safe_path(note_name: str) -> Path:
 # Used only in error messages — the actual routing is enforced by the set
 # membership check above.
 _GUARD_HINT = {
-    "memory.md":    "update_memory",
-    "reminders.md": "propose_action(kind='add_reminder', ...)",
+    "memory.md":    "no tool — memory.md is written only by the post-turn "
+                    "extractor. Memory updates happen automatically; you "
+                    "cannot make them yourself",
+    "reminders.md": "propose_action(kind='add_reminder', ...) instead",
 }
 
 
@@ -98,10 +100,10 @@ def _assert_writable(note_name: str, tool_name: str) -> None:
     """
     name = note_name.strip()
     if name in _PROTECTED_NOTES:
-        hint = _GUARD_HINT.get(name, "its dedicated tool")
+        hint = _GUARD_HINT.get(name, "use its dedicated tool instead")
         raise VaultError(
             f"{name} is a protected note and cannot be modified via "
-            f"{tool_name}. Use {hint} instead."
+            f"{tool_name}. Use {hint}."
         )
 
 

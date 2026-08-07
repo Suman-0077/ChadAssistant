@@ -29,7 +29,10 @@ Each layer only knows about the one below it.
 - `create_note(note_name, text)` — create a new note
 - `append_to_inbox(text)` — append to today's inbox/YYYY-MM-DD.md
 - `edit_section(note_name, section_heading, new_body)` — replace one section body
-- `update_memory(section, new_body)` — guarded write to memory.md (schema + token cap enforced)
+- `propose_action(kind, args)` — queue a side-effecting action for user approval
+
+`memory.md` is deliberately NOT writable by any tool. The post-turn
+extractor (`chad/extractor.py`) is its sole writer.
 
 ## Roadmap (future tools)
 
