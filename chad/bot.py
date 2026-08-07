@@ -21,12 +21,13 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
-from chad import brain, config, memory, proposals
+from chad import brain, config, memory, proposals, vault
 from chad.history import HistoryStore
 
 logging.basicConfig(
@@ -215,6 +216,55 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await q.edit_message_text("Unknown action. Ignoring.")
 
 
+# --- /memory command --------------------------------------------------------
+
+_TELEGRAM_MAX = 4000  # 4096 hard cap; leave headroom for code-fence markers
+
+
+def _split_for_telegram(text: str, limit: int = _TELEGRAM_MAX) -> list[str]:
+    """Slice text into chunks each under Telegram's per-message limit.
+
+    Splits on newline boundaries where possible so code blocks stay
+    readable; falls back to hard slicing for pathological single-line
+    inputs.
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        split = text.rfind("\n", 0, limit)
+        if split == -1:
+            split = limit
+        chunks.append(text[:split])
+        text = text[split:].lstrip("\n")
+    return chunks
+
+
+async def _handle_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dump memory.md back to the chat — no LLM involved.
+
+    The whole point is inspection: what does Chad actually think it
+    knows? Answered by reading the file directly. If we routed this
+    through brain.think we'd pay for an API call to have Chad tell us
+    what we could read ourselves.
+    """
+    if update.effective_user.id != config.ALLOWED_TELEGRAM_ID:
+        return
+    try:
+        content = vault.read_note("memory.md")
+    except vault.VaultError:
+        await update.message.reply_text("(memory.md does not exist yet)")
+        return
+    if not content.strip():
+        await update.message.reply_text("(memory.md is empty)")
+        return
+    for chunk in _split_for_telegram(content):
+        await update.message.reply_text(chunk)
+
+
 # --- Wiring -----------------------------------------------------------------
 
 def main() -> None:
@@ -224,6 +274,7 @@ def main() -> None:
     memory.ensure_exists()
 
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("memory", _handle_memory_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
     app.add_handler(CallbackQueryHandler(_handle_callback))
     log.info("Chad is online. Listening for messages...")

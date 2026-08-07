@@ -1,0 +1,17 @@
+[Unit]
+Description=Fire Chad morning reminders daily at 07:00 in the user's timezone
+Requires=chad-morning.service
+
+[Timer]
+# 07:00 local time. The server should have its system timezone set to
+# match config.USER_TIMEZONE (Australia/Sydney) — set once with:
+#   timedatectl set-timezone Australia/Sydney
+# Alternatively, OnCalendar supports a per-line timezone on systemd 247+:
+#   OnCalendar=*-*-* 07:00:00 Australia/Sydney
+OnCalendar=*-*-* 07:00:00
+# If the machine was off at 07:00, fire on next boot so we don't miss a day.
+Persistent=true
+Unit=chad-morning.service
+
+[Install]
+WantedBy=timers.target

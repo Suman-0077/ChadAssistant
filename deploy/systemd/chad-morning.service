@@ -1,0 +1,11 @@
+[Unit]
+Description=Chad morning reminders — scan reminders.md and push items due today via Telegram
+Wants=chad-morning.timer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/chad
+ExecStart=/root/chad/.venv/bin/python -m chad.cron.morning_reminders
+User=root

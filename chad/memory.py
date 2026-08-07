@@ -19,7 +19,7 @@ log) will build on this module.
 
 import logging
 
-from chad import config, vault
+from chad import audit, config, vault
 
 log = logging.getLogger("chad.memory")
 
@@ -102,6 +102,7 @@ def ensure_exists() -> None:
     if path.exists():
         return
     vault.create_note(MEMORY_FILENAME, INITIAL_CONTENT)
+    audit.log_memory_write("bootstrap", "*", INITIAL_CONTENT)
     log.info("Bootstrapped memory.md with fixed section schema at %s", path)
 
 
@@ -137,6 +138,7 @@ def write_section(section: str, new_body: str) -> str:
         )
 
     vault.write_note_raw(MEMORY_FILENAME, proposed)
+    audit.log_memory_write("inline", section, new_body)
     return (
         f"Updated memory.md section '{section}' "
         f"(~{_estimated_tokens(proposed)}/{TOKEN_CAP} tokens used)."
