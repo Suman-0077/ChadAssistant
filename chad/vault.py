@@ -16,6 +16,7 @@ Every public function takes a note *name* relative to the vault root
 
 import fcntl
 import re
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -299,8 +300,33 @@ def edit_section(note_name: str, section_heading: str, new_body: str) -> str:
 _LOCKS_DIR = config.STATE_DIR / "locks"
 
 
+class LockReentryError(RuntimeError):
+    """Raised when the same thread tries to acquire a lock it already holds.
+
+    vault.lock uses fcntl.flock, which is NOT reentrant — a second
+    acquire in the same process blocks forever silently, with no
+    exception and no log line. A hang no one can debug at 3am.
+
+    We keep a thread-local set of held note names and raise this
+    error immediately on re-entry, so the mistake surfaces during
+    development instead of production.
+    """
+
+
+# Held-lock names per-thread. Guards against nested lock() calls
+# within a single thread that would otherwise deadlock (see M2 in the
+# M4/M5 review).
+_held_locks = threading.local()
+
+
+def _held_set() -> set[str]:
+    if not hasattr(_held_locks, "names"):
+        _held_locks.names = set()
+    return _held_locks.names
+
+
 @contextmanager
-def lock(note_name: str):
+def lock(note_name: str, *, timeout: float = 15.0):
     """Acquire an exclusive advisory lock over a note's read-modify-write cycle.
 
     Any code that reads a vault file, computes a change from what it
@@ -309,9 +335,10 @@ def lock(note_name: str):
     interleave — both reading the same version, both computing against
     it, both writing — and lose one of the changes.
 
-    Blocking: acquires the lock, yields, releases on exit. In practice
-    a few milliseconds because vault R-M-W is fast. If it ever blocked
-    noticeably we'd have bigger problems.
+    Not reentrant — see LockReentryError. A second acquire in the same
+    thread raises rather than hanging. Non-blocking retry loop with a
+    deadline, raising LockReentryError after `timeout` seconds so a
+    contended lock surfaces as an error, not a silent freeze.
 
     Uses fcntl.flock on a sidecar lockfile per note (path segments
     flattened to a filename). fcntl locks are process-local: safe
@@ -319,13 +346,36 @@ def lock(note_name: str):
     on the same machine. That's the whole reason cron + bot don't need
     a shared library — they both grab the same file.
     """
+    import time
+    held = _held_set()
+    if note_name in held:
+        raise LockReentryError(
+            f"vault.lock({note_name!r}) is not reentrant. The same thread "
+            f"already holds it — this call would deadlock. Refactor to hold "
+            f"the lock once around the whole read-modify-write."
+        )
+
     _LOCKS_DIR.mkdir(parents=True, exist_ok=True)
     lockfile = _LOCKS_DIR / (note_name.replace("/", "__") + ".lock")
+    deadline = time.monotonic() + timeout
     with lockfile.open("a+") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LockReentryError(
+                        f"vault.lock({note_name!r}) timed out after {timeout}s "
+                        f"— another process is holding the lock. Not the "
+                        f"model's mistake but still worth investigating."
+                    )
+                time.sleep(0.05)
+        held.add(note_name)
         try:
             yield
         finally:
+            held.discard(note_name)
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 

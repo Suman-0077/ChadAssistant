@@ -6,12 +6,15 @@ immediately with a clear message — a config error should never be
 discovered halfway through a conversation.
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
+
+_log = logging.getLogger("chad.config")
 
 # Read the .env file sitting in the project root (the directory you run
 # `python -m chad.bot` from). Existing real environment variables win over
@@ -93,6 +96,10 @@ EXTRACTOR_MODEL = os.environ.get("EXTRACTOR_MODEL", "claude-haiku-4-5").strip()
 # Anything else is treated as 'shadow' with a warning.
 EXTRACTOR_MODE = os.environ.get("EXTRACTOR_MODE", "shadow").strip().lower()
 if EXTRACTOR_MODE not in ("shadow", "live"):
-    print(f"Config warning: EXTRACTOR_MODE={EXTRACTOR_MODE!r} unrecognised; "
-          f"defaulting to 'shadow'.")
+    # Use the logger, not print — under systemd, print goes to stdout
+    # where a typo is easy to miss; the logger lands in journalctl.
+    _log.warning(
+        "EXTRACTOR_MODE=%r unrecognised; defaulting to 'shadow'.",
+        EXTRACTOR_MODE,
+    )
     EXTRACTOR_MODE = "shadow"

@@ -17,33 +17,43 @@ the whole system:
 
     A one-time injection has become permanent, privileged instruction.
 
-Five defences layered here (removing any of them breaks the boundary):
+Six defences layered here (removing any of them breaks the boundary):
 
-  1. SANITISE INPUT. Every `tool_result` block is stripped before the
-     extractor sees the exchange. Assistant `tool_use` intentions and
-     final text remain; the user's own text messages remain. Anything
-     an external tool call could have carried in — email body, PDF
-     text, web fetch — is gone before the extractor's prompt is built.
+  1. USER TEXT ONLY. The extractor is fed ONLY user-authored text turns —
+     not assistant replies, not tool_result blocks, not tool_use blocks.
+     The project's invariant is that only the user's Telegram messages
+     are instructions; the extractor applies the same rule. If Chad
+     paraphrases untrusted email content in its reply, that paraphrase
+     doesn't reach the extractor. Structural boundary, not lexical.
 
-  2. CONSTRAINED OUTPUT SCHEMA. The extractor returns strict JSON:
-     [{section, operation, content}]. section MUST be one of the five
-     fixed names. operation MUST be 'add'. content MUST be a declarative
-     sentence about the user. Anything else is dropped in validation.
+  2. CONSTRAINED OUTPUT SHAPE. Strict JSON: [{section, operation, content}].
+     section MUST be one of the five fixed names. operation MUST be 'add'.
+     content MUST be a single-line non-empty string, no headings, under a
+     length cap. Multi-line or heading-shaped content would inject a
+     second `##` heading into memory.md, permanently blocking
+     compute_section_edit — a whole-section denial-of-service by accident
+     that nothing but manual SSH would fix.
 
-  3. REJECT IMPERATIVE CONTENT. A regex check refuses any content that
-     reads as an instruction to Chad ("always", "never", "forward",
-     "send", "delete", references to instructions or system prompt).
-     Facts about the user only.
+  3. REJECT IMPERATIVE CONTENT. Per-line regex check (case-insensitive)
+     after stripping leading punctuation. Refuses content that reads as
+     an instruction to Chad ("always", "never", "forward", "send",
+     "delete", references to instructions or system prompt). Not
+     bulletproof against paraphrase (see the review); the real
+     mitigation is defence #1.
 
-  4. DEDUPE ON WRITE. Before applying an add, we read the current
-     section body. If the content is already there, noop. Same text
-     twice cannot compound. Done inside the memory lock so a concurrent
+  4. LINE-BASED DEDUPE. Compare normalised lines against the current
+     section body, not a raw substring test — otherwise a distinct new
+     fact that happens to be a substring of an existing line is
+     silently dropped. Done inside the memory lock so a concurrent
      writer can't slip a duplicate in.
 
   5. AUDIT EVERY DECISION. Every attempted edit — accepted, rejected,
      noop — is logged. source='extractor-shadow' in shadow mode,
      'extractor' in live mode. First weeks of operation, this log is
      the ground truth for whether the extractor is trustworthy.
+
+  6. FAIL-SAFE. Any exception is logged and swallowed. The user has
+     already received their reply; a broken extractor never resurfaces.
 
 Extractor failure is best-effort. If anything raises, the user has
 already received their reply — a broken extractor never blocks or
@@ -73,33 +83,35 @@ _client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 # --- Sanitiser --------------------------------------------------------------
 
 def sanitise(messages: list[dict]) -> list[dict]:
-    """Return a copy of `messages` with every tool_result block stripped.
+    """Return only user-authored text turns from the exchange.
 
-    This is the trust boundary between "content the user or Chad wrote"
-    and "content an external source injected via a tool call". Removing
-    the tool_result blocks before the extractor sees them is what defeats
-    the email-injection attack in §9 of the memory design doc.
+    The trust boundary is structural: only what the USER typed reaches
+    the extractor. Nothing else. That means:
 
-    Assistant tool_use blocks stay (they show Chad's intent), and text
-    blocks stay on both sides. If stripping tool_results leaves a user
-    turn empty, we drop the turn entirely rather than emit a stub.
+      * assistant turns are dropped entirely — they include paraphrases
+        of tool output (email bodies, PDF content, web fetches) and are
+        NOT an independent source of durable facts about the user.
+      * tool_result blocks are dropped — untrusted content from tools.
+      * user turns whose content is a list-of-blocks are tool_result
+        batches masquerading as user role; dropped.
+      * synthetic markers we appended (approval / rejection notes) are
+        role=user + string content, which passes; harmless, the
+        extractor's imperative filter and dedupe handle them.
+
+    This is the fix for finding C1 in the M4/M5 review: the previous
+    version kept assistant text, so a hostile email that Chad
+    paraphrased in its reply reached the extractor anyway.
     """
     clean: list[dict] = []
     for msg in messages:
-        role = msg.get("role")
+        if msg.get("role") != "user":
+            continue
         content = msg.get("content")
-        # User turns with list-of-blocks content are tool_result batches.
-        # Filter to non-tool_result blocks; drop the turn if empty.
-        if isinstance(content, list):
-            kept = [
-                b for b in content
-                if not (isinstance(b, dict) and b.get("type") == "tool_result")
-            ]
-            if not kept:
-                continue
-            clean.append({"role": role, "content": copy.deepcopy(kept)})
-        else:
-            clean.append({"role": role, "content": content})
+        if not isinstance(content, str):
+            continue  # list-of-blocks = tool_result batch, drop
+        if not content.strip():
+            continue
+        clean.append({"role": "user", "content": content})
     return clean
 
 
@@ -136,35 +148,32 @@ If the user only asked a question or the exchange was small talk, return [].
 
 
 def _build_prompt(clean_messages: list[dict]) -> str:
-    """Serialise the sanitised exchange into a compact text form for the extractor."""
-    parts = []
-    for msg in clean_messages:
-        role = msg.get("role", "?")
-        content = msg.get("content")
-        if isinstance(content, str):
-            parts.append(f"[{role}] {content}")
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        parts.append(f"[{role}] {block.get('text', '')}")
-                    # tool_use blocks preserved as Chad's intent, but
-                    # not their full args — the extractor doesn't need
-                    # to see arbitrary payloads.
-                    elif block.get("type") == "tool_use":
-                        parts.append(
-                            f"[{role} tool_use] {block.get('name', '?')}"
-                        )
-    return "\n\n".join(parts)
+    """Serialise sanitised user turns into a compact text form.
+
+    sanitise() has already dropped everything except user text turns,
+    so this is straightforward. Each turn on its own line, prefixed
+    [user] for clarity in the extractor's prompt.
+    """
+    return "\n\n".join(
+        f"[user] {m['content']}" for m in clean_messages
+    )
 
 
 # --- Validation -------------------------------------------------------------
 
-# Imperative markers. Any content matching these — case-insensitive —
-# is rejected regardless of what the extractor thought.
+# Hard limits for a single extracted fact.
+MAX_CONTENT_CHARS = 200
+
+# Leading-punctuation stripper. Regex-anchored imperative check misses
+# any content starting with `-`, `*`, `1.`, `>`, quotes, etc. — all
+# common LLM output shapes. Strip these before matching.
+_LEADING_PUNCT = re.compile(r"^[\s\W]+")
+
+# Imperative markers. Case-insensitive. Not bulletproof against paraphrase
+# — the real defence is sanitise() feeding only user text.
 _IMPERATIVE_START = re.compile(
-    r"^\s*(always|never|forward|send|delete|remove|call|email|"
-    r"reply|share|post|share|ignore|override|stop|start)\b",
+    r"^(always|never|forward|send|delete|remove|call|email|"
+    r"reply|share|post|ignore|override|stop|start)\b",
     re.IGNORECASE,
 )
 _IMPERATIVE_MARKERS = re.compile(
@@ -175,13 +184,41 @@ _IMPERATIVE_MARKERS = re.compile(
 
 
 def _looks_imperative(content: str) -> bool:
-    """Cheap keyword check for content that reads as an instruction."""
+    """Cheap keyword check for content that reads as an instruction.
+
+    Strips leading whitespace and punctuation first (so a bulleted
+    'Always ...' still matches), then checks the start-of-content
+    verb list plus a marker list that hits mid-content phrases.
+    """
     if not isinstance(content, str):
         return True  # anything not-a-string is malformed; reject
-    if _IMPERATIVE_START.search(content):
+    stripped = _LEADING_PUNCT.sub("", content)
+    if _IMPERATIVE_START.match(stripped):
         return True
     if _IMPERATIVE_MARKERS.search(content):
         return True
+    return False
+
+
+def _line_normalise(line: str) -> str:
+    """Normalise a line for dedupe comparison: strip, lowercase, drop leading bullet."""
+    s = line.strip().lower()
+    # Strip common bullet prefixes so "- foo" and "foo" dedupe together.
+    return _LEADING_PUNCT.sub("", s)
+
+
+def _already_present(content: str, section_body: str) -> bool:
+    """True if `content` (normalised) matches any existing line in `section_body`.
+
+    Fixes M1 — the previous substring test dropped legitimate new facts
+    that happened to be substrings of an existing line.
+    """
+    target = _line_normalise(content)
+    if not target:
+        return True  # empty content is degenerate; treat as duplicate
+    for existing in section_body.splitlines():
+        if _line_normalise(existing) == target:
+            return True
     return False
 
 
@@ -219,6 +256,25 @@ def validate_edits(raw: str) -> list[dict]:
         if not isinstance(content, str) or not content.strip():
             log.info("Dropping edit with empty/non-string content")
             continue
+
+        # C2 fixes: reject multi-line, heading-shaped, and oversized
+        # content. Any of these could permanently break memory.md by
+        # inserting a second `##` heading (compute_section_edit refuses
+        # ambiguous headings, so every future write to that section
+        # would fail).
+        if "\n" in content or "\r" in content:
+            log.warning("Dropping multi-line content: %r", content)
+            continue
+        if content.lstrip().startswith("#"):
+            log.warning("Dropping heading-shaped content: %r", content)
+            continue
+        if len(content) > MAX_CONTENT_CHARS:
+            log.warning(
+                "Dropping oversized content (%d > %d chars): %r",
+                len(content), MAX_CONTENT_CHARS, content[:80] + "...",
+            )
+            continue
+
         if _looks_imperative(content):
             log.warning(
                 "Dropping IMPERATIVE content (injection defence): %r", content,
@@ -252,7 +308,7 @@ def _apply(edits: list[dict], live: bool) -> None:
         try:
             with vault.lock(memory.MEMORY_FILENAME):
                 current = memory.read_section_body(section)
-                if content in current:
+                if _already_present(content, current):
                     audit.log_memory_write(source, section, f"[noop dedupe] {content}")
                     log.info("Skipping duplicate for %s: %s", section, content)
                     continue
@@ -271,8 +327,20 @@ def _apply(edits: list[dict], live: bool) -> None:
 
 # --- Entry point ------------------------------------------------------------
 
-def run(messages: list[dict]) -> None:
-    """Extract durable facts from a completed exchange and apply them.
+# Track how many user turns per chat we've already fed to the extractor,
+# so each call only processes the tail added by this exchange. Prevents
+# both the token cost and the repeated-judgement risk called out in M3.
+# Reset on bot restart — worst case we re-process one recent turn.
+_last_processed: dict[int, int] = {}
+
+
+def run(messages: list[dict], chat_id: int | None = None) -> None:
+    """Extract durable facts from the NEW user turns and apply them.
+
+    Only turns added since the last run for this chat_id are processed.
+    Fixes M3 in the M4/M5 review — previously we re-processed the whole
+    (up to 40k-char) history every turn, paying tokens each time and
+    re-rolling the imperative filter on already-seen content.
 
     Fail-safe: any exception here is logged and swallowed. The user has
     already received their reply; a broken extractor must never
@@ -283,8 +351,16 @@ def run(messages: list[dict]) -> None:
         if not clean:
             return
 
-        prompt = _build_prompt(clean)
+        # M3: only the tail added since the last extractor run.
+        cutoff = _last_processed.get(chat_id, 0) if chat_id is not None else 0
+        new_turns = clean[cutoff:]
+        if not new_turns:
+            return
+
+        prompt = _build_prompt(new_turns)
         if not prompt.strip():
+            if chat_id is not None:
+                _last_processed[chat_id] = len(clean)
             return
 
         response = _client.messages.create(
@@ -300,14 +376,19 @@ def run(messages: list[dict]) -> None:
         ).strip()
 
         edits = validate_edits(raw)
-        if not edits:
+        if edits:
+            live = (config.EXTRACTOR_MODE == "live")
+            log.info("Extractor: %d valid edit(s) — mode=%s",
+                     len(edits), config.EXTRACTOR_MODE)
+            _apply(edits, live=live)
+        else:
             log.info("Extractor produced no edits")
-            return
 
-        live = (config.EXTRACTOR_MODE == "live")
-        log.info("Extractor: %d valid edit(s) — mode=%s",
-                 len(edits), config.EXTRACTOR_MODE)
-        _apply(edits, live=live)
+        # Advance the cursor whether or not we produced edits — the
+        # turns were seen, we've made our judgement, no reason to
+        # re-judge them next call.
+        if chat_id is not None:
+            _last_processed[chat_id] = len(clean)
 
     except Exception:
         log.exception("Extractor run failed; main reply already sent")

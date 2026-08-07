@@ -133,10 +133,11 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # M4: post-turn extractor. Runs AFTER the user's reply is already
     # out — extractor failure or slowness only delays the next message,
-    # never the current one. Sanitises tool_result blocks out before
-    # feeding the exchange to Haiku (§9 injection boundary).
+    # never the current one. sanitise() keeps only user text turns
+    # (§9 injection boundary) and run() only processes turns added
+    # since its last call for this chat.
     try:
-        extractor.run(history)
+        extractor.run(history, chat_id=chat_id)
     except Exception:
         log.exception("Extractor raised (best-effort; reply already sent)")
 
