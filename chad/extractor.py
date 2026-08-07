@@ -119,8 +119,13 @@ _SYSTEM_PROMPT = """You are Chad's memory extractor. Given a completed \
 conversation exchange between Chad and its user, return a JSON list of \
 durable facts to add to Chad's memory file.
 
+OUTPUT FORMAT — read this twice:
+Respond with a raw JSON array and NOTHING else. No markdown code fences \
+(no ```json), no explanation before it, no commentary after it. Your \
+entire response must start with [ and end with ]. If nothing is durable, \
+your entire response is exactly: []
+
 RULES:
-- Output ONLY valid JSON, nothing else. A JSON list of objects.
 - Each object has three keys: section, operation, content.
 - section MUST be one of: Identity, Preferences, Ongoing, Decisions, Archive.
 - operation MUST be "add".
@@ -253,16 +258,67 @@ def _already_present(content: str, section_body: str) -> bool:
     return False
 
 
+def _extract_json_array(raw: str) -> str | None:
+    """Pull a JSON array out of a model response that may be wrapped.
+
+    Models routinely wrap JSON in markdown code fences and append prose
+    ("This is a simple informational question. Nothing durable..."),
+    both of which make json.loads fail on the raw string. The eval
+    harness caught exactly this: every extractor call was silently
+    returning [] because the response started with ```json.
+
+    Strategy: find the first '[' and the matching final ']' by bracket
+    depth, ignoring brackets inside JSON strings. Returns None if no
+    balanced array is present.
+    """
+    if not isinstance(raw, str):
+        return None
+    start = raw.find("[")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return raw[start:i + 1]
+    return None
+
+
 def validate_edits(raw: str) -> list[dict]:
     """Parse the extractor's raw output and return only valid edits.
 
     Returns an empty list rather than raising: extractor failure is
     best-effort. Anything malformed is logged and dropped.
     """
+    candidate = _extract_json_array(raw)
+    if candidate is None:
+        log.warning("Extractor output contained no JSON array: %r",
+                    raw[:200])
+        return []
+
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(candidate)
     except json.JSONDecodeError as e:
-        log.warning("Extractor output was not valid JSON: %s", e)
+        log.warning("Extractor output was not valid JSON: %s (raw: %r)",
+                    e, candidate[:200])
         return []
 
     if not isinstance(parsed, list):
