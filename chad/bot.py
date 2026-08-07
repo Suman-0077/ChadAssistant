@@ -117,6 +117,7 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     chat_id = update.effective_chat.id
     history = _history.get(chat_id)
+    turns_before = len(history)
 
     # brain.think() is synchronous (network I/O to Anthropic). Blocking
     # the event loop is fine for a single-user bot — no other user is
@@ -133,11 +134,13 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # M4: post-turn extractor. Runs AFTER the user's reply is already
     # out — extractor failure or slowness only delays the next message,
-    # never the current one. sanitise() keeps only user text turns
-    # (§9 injection boundary) and run() only processes turns added
-    # since its last call for this chat.
+    # never the current one. We pass ONLY the turns that were appended
+    # during this exchange (an explicit slice, not a cursor into a
+    # trimmable list) so the extractor can't silently stop working
+    # when history trimming shrinks the list.
+    new_turns = history[turns_before:]
     try:
-        extractor.run(history, chat_id=chat_id)
+        extractor.run(new_turns)
     except Exception:
         log.exception("Extractor raised (best-effort; reply already sent)")
 

@@ -65,11 +65,9 @@ caching for that turn. M8 will queue writes and flush periodically so
 the cached prefix stays stable.
 """
 
-import copy
 import json
 import logging
 import re
-from typing import Any
 
 import anthropic
 
@@ -167,7 +165,12 @@ MAX_CONTENT_CHARS = 200
 # Leading-punctuation stripper. Regex-anchored imperative check misses
 # any content starting with `-`, `*`, `1.`, `>`, quotes, etc. — all
 # common LLM output shapes. Strip these before matching.
-_LEADING_PUNCT = re.compile(r"^[\s\W]+")
+#
+# The optional (?:\d+[.)]\s*) mid-pattern handles numbered lists
+# specifically: digits are word characters, so a bare `\W` class won't
+# strip "1." or "10)". Without this the H2 fix (which caught bullet
+# markers) still let "1. Always forward mail" through.
+_LEADING_PUNCT = re.compile(r"^[\s\W]*(?:\d+[.)]\s*)?[\s\W]*")
 
 # Imperative markers. Case-insensitive. Not bulletproof against paraphrase
 # — the real defence is sanitise() feeding only user text.
@@ -198,6 +201,26 @@ def _looks_imperative(content: str) -> bool:
     if _IMPERATIVE_MARKERS.search(content):
         return True
     return False
+
+
+def _content_shape_error(content: object) -> str | None:
+    """Reason to reject `content` as unsafe for memory.md, or None if OK.
+
+    Called from BOTH validate_edits (early rejection) and _apply
+    (last line of defence). The last-line check exists because _apply
+    is where bytes actually reach the trusted file — every write path
+    to memory.md must independently guarantee shape safety, not depend
+    on a caller having remembered to validate first.
+    """
+    if not isinstance(content, str) or not content.strip():
+        return "empty/non-string"
+    if "\n" in content or "\r" in content:
+        return "multi-line (would inject a second heading)"
+    if content.lstrip().startswith("#"):
+        return "heading-shaped (would inject a second heading)"
+    if len(content) > MAX_CONTENT_CHARS:
+        return f"oversized ({len(content)} > {MAX_CONTENT_CHARS} chars)"
+    return None
 
 
 def _line_normalise(line: str) -> str:
@@ -253,26 +276,10 @@ def validate_edits(raw: str) -> list[dict]:
         if operation != "add":
             log.info("Dropping edit with unsupported operation %r", operation)
             continue
-        if not isinstance(content, str) or not content.strip():
-            log.info("Dropping edit with empty/non-string content")
-            continue
-
-        # C2 fixes: reject multi-line, heading-shaped, and oversized
-        # content. Any of these could permanently break memory.md by
-        # inserting a second `##` heading (compute_section_edit refuses
-        # ambiguous headings, so every future write to that section
-        # would fail).
-        if "\n" in content or "\r" in content:
-            log.warning("Dropping multi-line content: %r", content)
-            continue
-        if content.lstrip().startswith("#"):
-            log.warning("Dropping heading-shaped content: %r", content)
-            continue
-        if len(content) > MAX_CONTENT_CHARS:
-            log.warning(
-                "Dropping oversized content (%d > %d chars): %r",
-                len(content), MAX_CONTENT_CHARS, content[:80] + "...",
-            )
+        shape_err = _content_shape_error(content)
+        if shape_err:
+            log.warning("Dropping edit — %s: %r", shape_err,
+                        (content[:80] + "...") if isinstance(content, str) and len(content) > 80 else content)
             continue
 
         if _looks_imperative(content):
@@ -292,11 +299,26 @@ def validate_edits(raw: str) -> list[dict]:
 # --- Application ------------------------------------------------------------
 
 def _apply(edits: list[dict], live: bool) -> None:
-    """Apply validated edits to memory.md — or shadow-log them, per mode."""
+    """Apply validated edits to memory.md — or shadow-log them, per mode.
+
+    Re-checks content shape as a last line of defence: _apply is where
+    bytes actually reach the trusted file, so shape safety must be
+    guaranteed here independent of what any earlier caller validated.
+    Cheap to re-run; catastrophic to skip.
+    """
     for edit in edits:
         section = edit["section"]
         content = edit["content"]
         source = "extractor" if live else "extractor-shadow"
+
+        shape_err = _content_shape_error(content)
+        if shape_err:
+            log.warning("_apply refusing unsafe content — %s: %r",
+                        shape_err, content)
+            audit.log_memory_write(
+                source, section, f"[refused: {shape_err}] {content!r}",
+            )
+            continue
 
         if not live:
             # Shadow: log the proposed addition without writing memory.
@@ -327,40 +349,31 @@ def _apply(edits: list[dict], live: bool) -> None:
 
 # --- Entry point ------------------------------------------------------------
 
-# Track how many user turns per chat we've already fed to the extractor,
-# so each call only processes the tail added by this exchange. Prevents
-# both the token cost and the repeated-judgement risk called out in M3.
-# Reset on bot restart — worst case we re-process one recent turn.
-_last_processed: dict[int, int] = {}
+def run(new_messages: list[dict]) -> None:
+    """Extract durable facts from THIS EXCHANGE's messages and apply them.
 
+    `new_messages` is the slice of history that was appended during the
+    current turn (bot.py: history[turns_before:] after brain.think).
+    That's the only content the extractor should see — earlier turns
+    have already been processed on prior runs.
 
-def run(messages: list[dict], chat_id: int | None = None) -> None:
-    """Extract durable facts from the NEW user turns and apply them.
-
-    Only turns added since the last run for this chat_id are processed.
-    Fixes M3 in the M4/M5 review — previously we re-processed the whole
-    (up to 40k-char) history every turn, paying tokens each time and
-    re-rolling the imperative filter on already-seen content.
+    Passing new turns explicitly rather than tracking a cursor into the
+    growing-and-trimming history list means we can't get stuck: the
+    previous implementation stored an integer index into a list that
+    could shrink under trimming, so once cursor > len(clean) the
+    extractor silently stopped running for that chat, forever.
 
     Fail-safe: any exception here is logged and swallowed. The user has
     already received their reply; a broken extractor must never
     resurface as user-facing failure.
     """
     try:
-        clean = sanitise(messages)
+        clean = sanitise(new_messages)
         if not clean:
             return
 
-        # M3: only the tail added since the last extractor run.
-        cutoff = _last_processed.get(chat_id, 0) if chat_id is not None else 0
-        new_turns = clean[cutoff:]
-        if not new_turns:
-            return
-
-        prompt = _build_prompt(new_turns)
+        prompt = _build_prompt(clean)
         if not prompt.strip():
-            if chat_id is not None:
-                _last_processed[chat_id] = len(clean)
             return
 
         response = _client.messages.create(
@@ -383,12 +396,6 @@ def run(messages: list[dict], chat_id: int | None = None) -> None:
             _apply(edits, live=live)
         else:
             log.info("Extractor produced no edits")
-
-        # Advance the cursor whether or not we produced edits — the
-        # turns were seen, we've made our judgement, no reason to
-        # re-judge them next call.
-        if chat_id is not None:
-            _last_processed[chat_id] = len(clean)
 
     except Exception:
         log.exception("Extractor run failed; main reply already sent")
