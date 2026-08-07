@@ -14,7 +14,9 @@ Every public function takes a note *name* relative to the vault root
 (e.g. "inbox/2026-07-30.md"), never an absolute path.
 """
 
+import fcntl
 import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -287,6 +289,44 @@ def edit_section(note_name: str, section_heading: str, new_body: str) -> str:
     _backup(path)
     path.write_text(new_content, encoding="utf-8")
     return f"Edited section '{section_heading}' in {note_name}. Backup saved."
+
+
+# --- File locking ----------------------------------------------------------
+
+# Advisory locks live in a sibling directory to the vault-visible files,
+# so they're never confused with real notes. Persistent files (never
+# deleted) — only the fcntl lock state matters, not the file's content.
+_LOCKS_DIR = config.STATE_DIR / "locks"
+
+
+@contextmanager
+def lock(note_name: str):
+    """Acquire an exclusive advisory lock over a note's read-modify-write cycle.
+
+    Any code that reads a vault file, computes a change from what it
+    read, and writes the result MUST wrap that cycle in this lock.
+    Without it, two writers (main loop + extractor + cron) can
+    interleave — both reading the same version, both computing against
+    it, both writing — and lose one of the changes.
+
+    Blocking: acquires the lock, yields, releases on exit. In practice
+    a few milliseconds because vault R-M-W is fast. If it ever blocked
+    noticeably we'd have bigger problems.
+
+    Uses fcntl.flock on a sidecar lockfile per note (path segments
+    flattened to a filename). fcntl locks are process-local: safe
+    across threads within one process AND across cooperating processes
+    on the same machine. That's the whole reason cron + bot don't need
+    a shared library — they both grab the same file.
+    """
+    _LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    lockfile = _LOCKS_DIR / (note_name.replace("/", "__") + ".lock")
+    with lockfile.open("a+") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def write_note_raw(note_name: str, new_content: str) -> None:

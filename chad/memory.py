@@ -97,29 +97,66 @@ def ensure_exists() -> None:
 
     Called from bot startup so a fresh vault comes online with a valid
     memory file — no separate bootstrap step for the user to remember.
+    Locked so a concurrent startup + extractor can't both bootstrap.
     """
     path = config.VAULT_PATH / MEMORY_FILENAME
     if path.exists():
         return
-    # Cannot use create_note — memory.md is in _PROTECTED_NOTES, so the
-    # general write tools refuse it. write_note_raw is the documented
-    # escape hatch for guarded writers, and we've done our own check
-    # (the file doesn't exist yet). The bug this fixes: on a fresh
-    # vault, the bot would previously crash at startup because
-    # create_note refused the write.
-    vault.write_note_raw(MEMORY_FILENAME, INITIAL_CONTENT)
-    audit.log_memory_write("bootstrap", "*", INITIAL_CONTENT)
-    log.info("Bootstrapped memory.md with fixed section schema at %s", path)
+    with vault.lock(MEMORY_FILENAME):
+        # Re-check inside the lock — another writer may have created it
+        # while we waited.
+        if path.exists():
+            return
+        vault.write_note_raw(MEMORY_FILENAME, INITIAL_CONTENT)
+        audit.log_memory_write("bootstrap", "*", INITIAL_CONTENT)
+        log.info("Bootstrapped memory.md with fixed section schema at %s", path)
 
 
-def write_section(section: str, new_body: str) -> str:
-    """Replace the body of a memory.md section, enforcing schema + cap.
+def read_section_body(section: str) -> str:
+    """Return just the body of a memory.md section (no heading, no framing).
 
-    Raises:
-      vault.VaultError — section name isn't in the fixed schema, or the
-        underlying vault operation failed.
-      CapExceeded — the resulting file would exceed the token cap. The
-        write is NOT applied; consolidation must run first.
+    Used by the M4 extractor for its dedupe check. Empty string if the
+    file doesn't exist or the section is empty. Raises VaultError if
+    section isn't in the fixed schema.
+    """
+    if section not in SECTIONS:
+        raise vault.VaultError(
+            f"'{section}' is not a valid memory section. "
+            f"Use one of: {', '.join(SECTIONS)}."
+        )
+    path = config.VAULT_PATH / MEMORY_FILENAME
+    if not path.is_file():
+        return ""
+
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    heading_re = vault._HEADING_RE
+    # Find matching heading, extract body between it and the next
+    # heading of same/higher level.
+    headings = []
+    for i, line in enumerate(lines):
+        m = heading_re.match(line)
+        if m:
+            headings.append((i, len(m.group(1)), m.group(2).strip()))
+
+    for idx, (i, level, name) in enumerate(headings):
+        if name != section:
+            continue
+        end = len(lines)
+        for j, l, _ in headings[idx + 1:]:
+            if l <= level:
+                end = j
+                break
+        return "\n".join(lines[i + 1:end]).strip()
+
+    return ""
+
+
+def _write_section_locked(section: str, new_body: str, source: str) -> str:
+    """The write half of write_section, assuming the caller holds vault.lock.
+
+    Used by write_section directly and by the M4 extractor apply loop,
+    which needs to hold the lock across its own read + dedupe + write.
     """
     if section not in SECTIONS:
         raise vault.VaultError(
@@ -129,9 +166,10 @@ def write_section(section: str, new_body: str) -> str:
 
     path = config.VAULT_PATH / MEMORY_FILENAME
     if not path.is_file():
-        # Recover automatically — a missing memory.md is a bug in bootstrapping,
-        # not a reason to lose a write.
-        ensure_exists()
+        # Cannot recursively call ensure_exists (nested lock). Since
+        # we're inside the lock, bootstrap here directly.
+        vault.write_note_raw(MEMORY_FILENAME, INITIAL_CONTENT)
+        audit.log_memory_write("bootstrap", "*", INITIAL_CONTENT)
 
     current = path.read_text(encoding="utf-8")
     proposed = vault.compute_section_edit(current, section, new_body)
@@ -144,8 +182,24 @@ def write_section(section: str, new_body: str) -> str:
         )
 
     vault.write_note_raw(MEMORY_FILENAME, proposed)
-    audit.log_memory_write("inline", section, new_body)
+    audit.log_memory_write(source, section, new_body)
     return (
         f"Updated memory.md section '{section}' "
         f"(~{_estimated_tokens(proposed)}/{TOKEN_CAP} tokens used)."
     )
+
+
+def write_section(section: str, new_body: str, *, source: str = "inline") -> str:
+    """Replace the body of a memory.md section, enforcing schema + cap.
+
+    Atomic — holds vault.lock(MEMORY_FILENAME) across the read-compute-write
+    cycle so concurrent writers can't lose each other's changes.
+
+    Raises:
+      vault.VaultError — section name isn't in the fixed schema, or the
+        underlying vault operation failed.
+      CapExceeded — the resulting file would exceed the token cap. The
+        write is NOT applied; consolidation must run first.
+    """
+    with vault.lock(MEMORY_FILENAME):
+        return _write_section_locked(section, new_body, source)

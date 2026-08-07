@@ -94,18 +94,23 @@ def _mark_one_done(date_str: str, text: str) -> None:
     right before writing so any lines appended by the bot since we started
     survive. Only marks the FIRST match — same-content duplicates are rare
     and marking one at a time is safe (the other will fire next run).
+
+    Locked (M5) against concurrent bot appends. Combined with the re-read
+    inside the lock, the race that used to silently drop approved
+    reminders is closed properly, not just narrowed.
     """
-    lines = _load_lines()
-    target = f"{date_str} | {text}"
-    for j, raw in enumerate(lines):
-        if raw.strip() == target:
-            lines[j] = DONE_PREFIX + raw.lstrip()
-            vault.write_note_raw(REMINDERS_FILENAME, "".join(lines))
-            return
-    log.warning(
-        "Could not find %r in reminders.md to mark done (was it edited?).",
-        target,
-    )
+    with vault.lock(REMINDERS_FILENAME):
+        lines = _load_lines()
+        target = f"{date_str} | {text}"
+        for j, raw in enumerate(lines):
+            if raw.strip() == target:
+                lines[j] = DONE_PREFIX + raw.lstrip()
+                vault.write_note_raw(REMINDERS_FILENAME, "".join(lines))
+                return
+        log.warning(
+            "Could not find %r in reminders.md to mark done (was it edited?).",
+            target,
+        )
 
 
 async def main() -> None:

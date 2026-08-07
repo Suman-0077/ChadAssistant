@@ -79,3 +79,20 @@ except ZoneInfoNotFoundError:
 
 # Optional, with a sensible default. Override in .env to try other models.
 MODEL = os.environ.get("MODEL", "claude-sonnet-4-5").strip()
+
+# The extractor uses a cheaper model (Haiku by default) since it does one
+# bounded classification pass, not full reasoning.
+EXTRACTOR_MODEL = os.environ.get("EXTRACTOR_MODEL", "claude-haiku-4-5").strip()
+
+# --- Extractor (M4) ---------------------------------------------------------
+
+# 'shadow' = extractor runs, its proposed edits get logged to memory-audit.log
+#   with source='extractor-shadow' but NEVER touch memory.md. This is the
+#   default until the extractor has been observed working correctly.
+# 'live'   = extractor's edits also apply to memory.md (source='extractor').
+# Anything else is treated as 'shadow' with a warning.
+EXTRACTOR_MODE = os.environ.get("EXTRACTOR_MODE", "shadow").strip().lower()
+if EXTRACTOR_MODE not in ("shadow", "live"):
+    print(f"Config warning: EXTRACTOR_MODE={EXTRACTOR_MODE!r} unrecognised; "
+          f"defaulting to 'shadow'.")
+    EXTRACTOR_MODE = "shadow"

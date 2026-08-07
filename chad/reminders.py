@@ -82,14 +82,18 @@ def add_reminder(*, date: str, text: str) -> str:
     Called by proposals.STORE.execute() after user approval. Re-runs
     validation defensively — the args in the store could in theory be
     stale, and executor-time validation costs nothing.
+
+    Locked against the morning cron so a fire-and-clear cycle can't
+    lose an approval that lands between the cron's read and its write.
     """
     _parse_iso_date(date)
     text = _clean_text(text)
-    vault.append_line_raw(
-        REMINDERS_FILENAME,
-        f"{date}{_FIELD_SEP}{text}",
-        header_if_new="# Reminders\n\n",
-    )
+    with vault.lock(REMINDERS_FILENAME):
+        vault.append_line_raw(
+            REMINDERS_FILENAME,
+            f"{date}{_FIELD_SEP}{text}",
+            header_if_new="# Reminders\n\n",
+        )
     return f"Reminder set for {date}: {text}"
 
 

@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 
-from chad import brain, config, memory, proposals, vault
+from chad import brain, config, extractor, memory, proposals, vault
 from chad.history import HistoryStore
 
 logging.basicConfig(
@@ -130,6 +130,15 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Surface any proposals Chad queued during the turn.
     await _flush_proposals(chat_id, context)
+
+    # M4: post-turn extractor. Runs AFTER the user's reply is already
+    # out — extractor failure or slowness only delays the next message,
+    # never the current one. Sanitises tool_result blocks out before
+    # feeding the exchange to Haiku (§9 injection boundary).
+    try:
+        extractor.run(history)
+    except Exception:
+        log.exception("Extractor raised (best-effort; reply already sent)")
 
 
 # --- Callback handler (button taps) -----------------------------------------
