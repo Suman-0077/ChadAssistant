@@ -47,6 +47,12 @@ def _safe_path(note_name: str) -> Path:
     This is the jail. resolve() collapses any ".." segments and expands
     symlinks, and then we verify the result still lives under the vault
     root. If it doesn't, someone tried to escape.
+
+    Also refuses any dot-prefixed path segment. Chad's operational state
+    (.chad-state/, .chad-backups/, and Obsidian's .obsidian/, .git/)
+    lives in dot-folders precisely because it shouldn't be user-visible
+    or model-touchable. list_notes hides them; this makes read/write
+    tools refuse them too.
     """
     if not note_name or note_name.startswith("/"):
         raise VaultError("Note name must be a relative path like 'notes/todo.md'.")
@@ -56,6 +62,13 @@ def _safe_path(note_name: str) -> Path:
     # is_relative_to() answers: is candidate inside the vault folder?
     if not candidate.is_relative_to(config.VAULT_PATH):
         raise VaultError("Note name escapes the vault. Operation refused.")
+
+    rel = candidate.relative_to(config.VAULT_PATH)
+    if any(part.startswith(".") for part in rel.parts):
+        raise VaultError(
+            "Dot-prefixed folders (.chad-state, .chad-backups, .obsidian, "
+            "etc.) are reserved and cannot be read or written."
+        )
 
     if candidate.suffix != ".md":
         raise VaultError("Only .md files are allowed in the vault.")
@@ -90,12 +103,21 @@ def _assert_writable(note_name: str, tool_name: str) -> None:
 
 
 def _safe_dir(folder: str) -> Path:
-    """Same jail as _safe_path, but for a folder (no .md requirement)."""
+    """Same jail as _safe_path, but for a folder (no .md requirement).
+
+    Also refuses dot-prefixed segments — same reasoning as _safe_path.
+    """
     if folder.startswith("/"):
         raise VaultError("Folder must be a relative path like 'uni/comp2000'.")
     candidate = (config.VAULT_PATH / folder).resolve()
     if not candidate.is_relative_to(config.VAULT_PATH):
         raise VaultError("Folder escapes the vault. Operation refused.")
+    rel = candidate.relative_to(config.VAULT_PATH)
+    if any(part.startswith(".") for part in rel.parts):
+        raise VaultError(
+            "Dot-prefixed folders (.chad-state, .chad-backups, etc.) are "
+            "reserved and cannot be listed or written."
+        )
     if not candidate.is_dir():
         raise VaultError(f"Folder not found: {folder}")
     return candidate
@@ -268,14 +290,28 @@ def edit_section(note_name: str, section_heading: str, new_body: str) -> str:
 
 
 def write_note_raw(note_name: str, new_content: str) -> None:
-    """Write raw content to a note, with backup. Intended for memory.write_section
-    which has already computed and validated the content. Not exposed as a tool
-    — general callers should use append_note, create_note, or edit_section."""
+    """Atomically replace a note's contents, with a backup of the prior version.
+
+    The escape hatch for guarded writers that have done their own checks:
+      * memory.write_section (schema + token cap enforced)
+      * memory.ensure_exists (bootstrap; file must not exist yet)
+      * chad.cron.morning_reminders (rewrites reminders.md after firing)
+
+    Atomic in the sense that no reader ever sees a half-written file
+    (write to <name>.tmp, os.replace into position). NOT durable across
+    power loss — no fsync. Fine at this scale.
+
+    Skips _assert_writable on purpose (that's what "escape hatch"
+    means); callers own protection responsibility. Path jail still
+    applies via _safe_path.
+    """
     path = _safe_path(note_name)
     if path.is_file():
         _backup(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new_content, encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(new_content, encoding="utf-8")
+    tmp.replace(path)
 
 
 def append_line_raw(note_name: str, line: str, header_if_new: str = "") -> None:

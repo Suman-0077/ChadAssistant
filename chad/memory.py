@@ -101,7 +101,13 @@ def ensure_exists() -> None:
     path = config.VAULT_PATH / MEMORY_FILENAME
     if path.exists():
         return
-    vault.create_note(MEMORY_FILENAME, INITIAL_CONTENT)
+    # Cannot use create_note — memory.md is in _PROTECTED_NOTES, so the
+    # general write tools refuse it. write_note_raw is the documented
+    # escape hatch for guarded writers, and we've done our own check
+    # (the file doesn't exist yet). The bug this fixes: on a fresh
+    # vault, the bot would previously crash at startup because
+    # create_note refused the write.
+    vault.write_note_raw(MEMORY_FILENAME, INITIAL_CONTENT)
     audit.log_memory_write("bootstrap", "*", INITIAL_CONTENT)
     log.info("Bootstrapped memory.md with fixed section schema at %s", path)
 

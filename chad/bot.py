@@ -224,21 +224,27 @@ _TELEGRAM_MAX = 4000  # 4096 hard cap; leave headroom for code-fence markers
 def _split_for_telegram(text: str, limit: int = _TELEGRAM_MAX) -> list[str]:
     """Slice text into chunks each under Telegram's per-message limit.
 
-    Splits on newline boundaries where possible so code blocks stay
-    readable; falls back to hard slicing for pathological single-line
-    inputs.
+    Splits on newline boundaries where possible so blocks stay readable;
+    falls back to hard slicing for pathological single-line inputs.
+    Empty chunks are never returned — Telegram rejects empty messages
+    with a 400, which used to fail /memory on any file starting with a
+    blank line and longer than the limit.
     """
+    text = text.lstrip("\n")  # avoid an empty first chunk on leading newlines
     if len(text) <= limit:
-        return [text]
+        return [text] if text else []
     chunks: list[str] = []
     while text:
         if len(text) <= limit:
-            chunks.append(text)
+            if text:
+                chunks.append(text)
             break
         split = text.rfind("\n", 0, limit)
-        if split == -1:
+        if split <= 0:
             split = limit
-        chunks.append(text[:split])
+        chunk = text[:split]
+        if chunk:
+            chunks.append(chunk)
         text = text[split:].lstrip("\n")
     return chunks
 

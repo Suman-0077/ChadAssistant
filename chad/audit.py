@@ -34,6 +34,30 @@ log = logging.getLogger("chad.audit")
 
 AUDIT_LOG_PATH = config.STATE_DIR / "memory-audit.log"
 
+# Rotate when the active log exceeds this. We keep ONE archive
+# (<name>.1) — the older one is discarded on the next rotation. Cheap,
+# bounded, and enough to catch a run of bad extractor writes within a
+# reasonable inspection window. M4 lands unattended writes so this cap
+# must exist before it does; older content stays recoverable from
+# .chad-backups/ if genuinely needed.
+_MAX_LOG_BYTES = 10 * 1024 * 1024   # 10 MB
+
+
+def _maybe_rotate() -> None:
+    """If the log is over the cap, rotate current -> .1 (dropping any prior .1)."""
+    try:
+        if not AUDIT_LOG_PATH.exists():
+            return
+        if AUDIT_LOG_PATH.stat().st_size <= _MAX_LOG_BYTES:
+            return
+        archive = AUDIT_LOG_PATH.with_suffix(AUDIT_LOG_PATH.suffix + ".1")
+        if archive.exists():
+            archive.unlink()
+        AUDIT_LOG_PATH.rename(archive)
+        log.info("Rotated memory audit log; previous content -> %s", archive)
+    except OSError as e:
+        log.warning("Audit log rotation failed: %s", e)
+
 
 def log_memory_write(source: str, section: str, new_body: str) -> None:
     """Append one entry describing a memory.md write.
@@ -42,6 +66,7 @@ def log_memory_write(source: str, section: str, new_body: str) -> None:
     fail a real memory write. If the log can't be written we still
     complete the underlying operation.
     """
+    _maybe_rotate()
     entry = {
         "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": source,

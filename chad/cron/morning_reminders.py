@@ -15,11 +15,22 @@ File format:
 The write path (chad/reminders.py) always emits the pending form; this
 script prefixes lines with `[done] ` after firing so we don't re-notify.
 
-Concurrency note: reminders.md is currently appended to by the bot and
-rewritten by this script — a race exists (bot append lands between our
-read and rewrite → the append gets lost). Window is small (seconds per
-day) and M5's file locking will close it properly. Documented, not
-fixed here.
+Two hardening patterns applied per the M6 review:
+
+  * Mark-after-each-send. If a send fails partway through the batch,
+    everything already delivered is already recorded done — we don't
+    re-fire it on the next run.
+
+  * Re-read-before-write. Between the initial load and the write-back
+    the bot may have appended a newly-approved reminder. Instead of
+    clobbering with a stale snapshot, we re-read fresh from disk each
+    time and locate our line by *content*, not by index. Any lines
+    that appeared in the interim survive. Closes the silent-data-loss
+    race that M5's proper locking will make redundant.
+
+  * All writes go through vault.write_note_raw (M4 fix) — atomic,
+    backed up, path-jailed. vault.py stays the only module that
+    touches the filesystem.
 """
 
 import asyncio
@@ -30,7 +41,7 @@ from datetime import date as _date, datetime
 
 from telegram import Bot
 
-from chad import config
+from chad import config, vault
 
 logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -38,7 +49,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("chad.cron.morning_reminders")
 
-REMINDERS_PATH = config.VAULT_PATH / "reminders.md"
+REMINDERS_FILENAME = "reminders.md"
+REMINDERS_PATH = config.VAULT_PATH / REMINDERS_FILENAME
 DONE_PREFIX = "[done] "
 
 # Pending line: bare ISO date, space-ish, pipe, text.
@@ -51,16 +63,13 @@ def _load_lines() -> list[str]:
     return REMINDERS_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
 
 
-def _save_lines_atomic(lines: list[str]) -> None:
-    """Write lines back atomically — write to .tmp, os.replace."""
-    tmp = REMINDERS_PATH.with_suffix(REMINDERS_PATH.suffix + ".tmp")
-    tmp.write_text("".join(lines), encoding="utf-8")
-    tmp.replace(REMINDERS_PATH)
+def _find_due(lines: list[str], today: _date) -> list[tuple[str, str]]:
+    """Return (date_str, text) for each pending line due today or earlier.
 
-
-def _find_due(lines: list[str], today: _date) -> list[tuple[int, str, str]]:
-    """Return (index, date_str, text) for each pending line due today or earlier."""
-    due: list[tuple[int, str, str]] = []
+    Returns content, not indices — indices are unstable across the read /
+    send / re-read cycle we use to survive concurrent bot appends.
+    """
+    due: list[tuple[str, str]] = []
     for i, raw in enumerate(lines):
         stripped = raw.strip()
         if not stripped or stripped.startswith(DONE_PREFIX) or stripped.startswith("#"):
@@ -76,14 +85,27 @@ def _find_due(lines: list[str], today: _date) -> list[tuple[int, str, str]]:
             log.warning("Skipping bad date on line %d: %r", i, date_str)
             continue
         if reminder_date <= today:
-            due.append((i, date_str, text))
+            due.append((date_str, text))
     return due
 
 
-def _mark_done(lines: list[str], indices: list[int]) -> None:
-    """Prefix the given lines with DONE_PREFIX. Mutates lines in place."""
-    for i in indices:
-        lines[i] = DONE_PREFIX + lines[i].lstrip()
+def _mark_one_done(date_str: str, text: str) -> None:
+    """Prefix the matching pending line with DONE_PREFIX. Re-reads the file
+    right before writing so any lines appended by the bot since we started
+    survive. Only marks the FIRST match — same-content duplicates are rare
+    and marking one at a time is safe (the other will fire next run).
+    """
+    lines = _load_lines()
+    target = f"{date_str} | {text}"
+    for j, raw in enumerate(lines):
+        if raw.strip() == target:
+            lines[j] = DONE_PREFIX + raw.lstrip()
+            vault.write_note_raw(REMINDERS_FILENAME, "".join(lines))
+            return
+    log.warning(
+        "Could not find %r in reminders.md to mark done (was it edited?).",
+        target,
+    )
 
 
 async def main() -> None:
@@ -103,16 +125,29 @@ async def main() -> None:
     log.info("Firing %d reminder(s)", len(due))
 
     bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
-    for _, date_str, text in due:
+    for date_str, text in due:
         prefix = "Reminder" if date_str == today.isoformat() else "Overdue"
-        await bot.send_message(
-            chat_id=config.ALLOWED_TELEGRAM_ID,
-            text=f"{prefix} [{date_str}]: {text}",
-        )
+        try:
+            await bot.send_message(
+                chat_id=config.ALLOWED_TELEGRAM_ID,
+                text=f"{prefix} [{date_str}]: {text}",
+            )
+        except Exception:
+            # Don't mark done if we failed to deliver — user should get
+            # notified next run. Better a late reminder than a lost one.
+            log.exception("Failed to send reminder for %s: %s", date_str, text)
+            continue
 
-    _mark_done(lines, [i for i, _, _ in due])
-    _save_lines_atomic(lines)
-    log.info("Marked %d reminder(s) as done.", len(due))
+        # Mark done immediately after successful delivery (M2 fix).
+        # Re-read-and-match inside _mark_one_done (M3 fix) so a bot
+        # append between our load and this write isn't clobbered.
+        try:
+            _mark_one_done(date_str, text)
+        except Exception:
+            log.exception(
+                "Sent reminder but failed to mark done — will re-fire next run: "
+                "%s | %s", date_str, text,
+            )
 
 
 if __name__ == "__main__":
