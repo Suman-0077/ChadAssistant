@@ -23,10 +23,14 @@ from chad import config
 
 # Notes that MUST go through their own guarded write path. General-purpose
 # write tools (append_note, create_note, edit_section) all refuse these —
-# so the schema and cap checks on memory.md cannot be bypassed by picking
-# a different tool. Add to this set as more protected notes appear
-# (map.md at Rung 3, reminders.md if it gets structured).
-_PROTECTED_NOTES = frozenset({"memory.md"})
+# so the schema/cap/format checks on protected files cannot be bypassed
+# by picking a different tool. New guarded files MUST be added here at
+# the moment their dedicated executor is created; the M2 review caught
+# reminders.md missing.
+_PROTECTED_NOTES = frozenset({
+    "memory.md",       # guarded by memory.write_section (schema + token cap)
+    "reminders.md",    # guarded by reminders.add_reminder via proposals only
+})
 
 
 class VaultError(Exception):
@@ -59,18 +63,29 @@ def _safe_path(note_name: str) -> Path:
     return candidate
 
 
+# Human-readable pointer to the correct write path for each protected note.
+# Used only in error messages — the actual routing is enforced by the set
+# membership check above.
+_GUARD_HINT = {
+    "memory.md":    "update_memory",
+    "reminders.md": "propose_action(kind='add_reminder', ...)",
+}
+
+
 def _assert_writable(note_name: str, tool_name: str) -> None:
     """Refuse writes to notes with dedicated guarded write paths.
 
     Every user-facing mutating tool (append_note, create_note, edit_section)
-    calls this. The internal write_note_raw does NOT — it's the escape hatch
-    that guarded writers (memory.write_section) use to actually put bytes on
-    disk after their own checks.
+    calls this. The internal write_note_raw and append_line_raw do NOT —
+    they're the escape hatches that guarded writers use to actually put
+    bytes on disk after their own checks.
     """
-    if note_name.strip() in _PROTECTED_NOTES:
+    name = note_name.strip()
+    if name in _PROTECTED_NOTES:
+        hint = _GUARD_HINT.get(name, "its dedicated tool")
         raise VaultError(
-            f"{note_name} is a protected note and cannot be modified via "
-            f"{tool_name}. Use its dedicated tool (update_memory for memory.md)."
+            f"{name} is a protected note and cannot be modified via "
+            f"{tool_name}. Use {hint} instead."
         )
 
 
@@ -261,3 +276,27 @@ def write_note_raw(note_name: str, new_content: str) -> None:
         _backup(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(new_content, encoding="utf-8")
+
+
+def append_line_raw(note_name: str, line: str, header_if_new: str = "") -> None:
+    """Append a single line to a note, bypassing _assert_writable.
+
+    The escape hatch for guarded write paths that append rather than
+    replace — currently reminders.add_reminder. Path jail still applies
+    (via _safe_path); the caller is responsible for whatever format
+    validation makes sense for the target file.
+
+    If the file doesn't exist and header_if_new is provided, the header
+    is written first (so e.g. reminders.md starts with "# Reminders").
+    """
+    if not line.endswith("\n"):
+        line = line + "\n"
+    path = _safe_path(note_name)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if header_if_new:
+            path.write_text(header_if_new, encoding="utf-8")
+        else:
+            path.write_text("", encoding="utf-8")
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line)

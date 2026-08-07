@@ -1,62 +1,41 @@
 """Persistent conversation history for Chad.
 
 Rung-1 kept `_histories` as an in-memory dict, which means a systemctl
-restart wipes what Chad remembers of the current conversation. That's
-about to become unacceptable — the approval system (M2) queues actions
-between messages, and a pending "yes" tapped after a restart must still
-find the context it was proposed against.
+restart wipes what Chad remembers of the current conversation. That
+became unacceptable once approvals (M2) landed — a pending "yes" tapped
+after a restart must still find the context it was proposed against.
 
-This module gives us:
-  * One JSON file on disk, {chat_id: [messages]}.
-  * Load-time tolerance: missing file → empty; corrupt file → warn,
-    rename the broken file aside, start empty. The bot never crashes
-    on a bad history file and the original is preserved for inspection.
-  * Atomic save: write to .tmp, os.replace into position. Crash-*consistent*
-    (a crash never leaves a half-written file); NOT crash-durable in the
-    strict fsync sense — a power cut can lose the last write.
-  * Structure-aware trim that budgets by estimated size, then repairs
-    the head so the surviving history never starts with an orphaned
-    tool_result block (which the Anthropic API would reject and permanently
-    poison the store).
-
-The `content` field of assistant messages arrives from the Anthropic
-client as a list of pydantic block objects. We flatten those to plain
-dicts before serialising so the JSON stays clean and the file remains
-usable even if the client library upgrades.
+Guarantees:
+  * One JSON file on disk, `{chat_id: [messages]}`.
+  * Missing file → empty; corrupt file → preserved aside, empty start.
+    Delegated to chad.json_store so history and proposals cannot drift.
+  * Atomic save (write .tmp, os.replace). Crash-*consistent*; NOT
+    crash-durable (no fsync). Fine at this scale.
+  * Structure-aware trim (see _trim). Never persists a message list
+    that would be rejected by the Anthropic API for opening with an
+    orphaned tool_result, or for containing two consecutive same-role
+    messages.
 """
 
-import json
 import logging
-import os
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from chad import json_store
 
 log = logging.getLogger("chad.history")
 
 # Rough character budget for the entire persisted history of one chat.
-# Chose chars over "turn count" because a single read_note tool_result
+# Chose chars over turn count because a single read_note tool_result
 # can be tens of thousands of characters, so a fixed turn count has no
-# meaningful upper bound in cost. ~40k chars ≈ ~10k tokens, comfortably
-# small relative to the context window while keeping enough working
-# memory for a real conversation.
+# meaningful upper bound in cost. ~40k chars ≈ ~10k tokens.
 MAX_HISTORY_CHARS = 40_000
 
 
-def _to_plain(value: Any) -> Any:
-    """Recursively convert pydantic blocks to dicts so json.dumps works."""
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if isinstance(value, list):
-        return [_to_plain(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _to_plain(v) for k, v in value.items()}
-    return value
-
-
 def _serialised_size(entry: dict) -> int:
-    """Rough char count of one history entry, used as the trim budget unit."""
-    return len(json.dumps(_to_plain(entry), ensure_ascii=False))
+    """Rough char count of one history entry, used as the trim-budget unit."""
+    import json  # local: only used here
+    return len(json.dumps(json_store.to_plain(entry), ensure_ascii=False))
 
 
 def _is_valid_opener(entry: dict) -> bool:
@@ -72,20 +51,97 @@ def _is_valid_opener(entry: dict) -> bool:
     return isinstance(entry.get("content"), str)
 
 
+def _collapse_consecutive_same_role(messages: list[dict]) -> list[dict]:
+    """Merge consecutive messages that share a role.
+
+    The API expects strict alternation. Two consecutive user turns
+    (which _append_synthetic could produce if a tap follows a typed
+    message follows another tap) will 400 the request AND — because
+    HistoryStore.set persists trimmed history — brick the bot until the
+    JSON file is deleted by hand. Defence-in-depth for that scenario.
+
+    Merge rules, in order:
+
+      * str  + str   -> joined with a newline. Keeps the common case (two
+                        synthetic markers, or a marker plus a typed
+                        message) as a clean text turn.
+      * list + list  -> block lists concatenated.
+      * mixed        -> BOTH sides normalised to block lists and
+                        concatenated. Never flattened to text.
+
+    That last rule matters more than it looks. An earlier version
+    flattened mixed content with _flatten_content(), which rendered a
+    tool_result block as the literal string "[tool_result]" — destroying
+    it while leaving the assistant's tool_use in place. That orphaned
+    tool_use is exactly the corruption phase 2 of _trim() exists to
+    prevent, so the repair function had a path that caused the disease it
+    treats. Normalising to blocks preserves every block instead.
+
+    tool_result blocks are hoisted to the front of a merged list: the API
+    requires them at the start of a user turn.
+    """
+    if not messages:
+        return messages
+    out: list[dict] = [dict(messages[0])]
+    for entry in messages[1:]:
+        prev = out[-1]
+        if entry.get("role") == prev.get("role"):
+            prev_content = prev.get("content")
+            new_content = entry.get("content")
+            if isinstance(prev_content, str) and isinstance(new_content, str):
+                prev["content"] = prev_content + "\n" + new_content
+            else:
+                prev["content"] = _merge_blocks(prev_content, new_content)
+            continue
+        out.append(dict(entry))
+    return out
+
+
+def _as_blocks(content: Any) -> list[dict]:
+    """Normalise message content to a list of API content blocks.
+
+    A plain string becomes a single text block. A list is returned as-is.
+    Anything else is stringified into a text block rather than dropped —
+    losing content silently is worse than an ugly turn.
+    """
+    if isinstance(content, list):
+        return content
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    return [{"type": "text", "text": str(content)}]
+
+
+def _merge_blocks(first: Any, second: Any) -> list[dict]:
+    """Concatenate two contents as block lists, tool_result blocks first.
+
+    Preserves every block (notably tool_result, whose loss would orphan a
+    tool_use and make the whole request invalid). The reordering keeps the
+    result valid as a user turn, where the API expects any tool_result
+    blocks at the start.
+    """
+    blocks = _as_blocks(first) + _as_blocks(second)
+    tool_results = [b for b in blocks
+                    if isinstance(b, dict) and b.get("type") == "tool_result"]
+    if not tool_results:
+        return blocks
+    rest = [b for b in blocks
+            if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+    return tool_results + rest
+    return str(content)
+
+
 def _trim(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Trim history to fit MAX_HISTORY_CHARS, then repair the head.
+    """Trim history to fit MAX_HISTORY_CHARS, repair the head, dedupe roles.
 
-    Two phases:
-
-      1. Size-based tail. Walk from the newest message backward, adding
-         each entry to the surviving tail until the next one would push
-         us over budget.
-
-      2. Structural repair. Walk the surviving tail forward, dropping
-         entries until the first one is a valid opener. This prevents
-         the classic bug where a trim cuts between an assistant tool_use
-         and the following tool_result — leaving the API to reject every
-         subsequent request until someone deletes history.json by hand.
+    Three phases:
+      1. Size-based tail. Walk from the newest message backward until the
+         next entry would exceed budget.
+      2. Structural repair. Drop from the head until the first entry is a
+         valid opener (user text message). Prevents the classic bug where
+         a cut lands between assistant tool_use and its tool_result.
+      3. Role collapse. Merge any consecutive same-role entries left by
+         approvals / rejections stamping synthetic user markers next to
+         real user turns.
     """
     # Phase 1: size-based tail.
     tail_size = 0
@@ -98,11 +154,12 @@ def _trim(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         tail_size += entry_size
     tail = messages[cutoff:]
 
-    # Phase 2: repair the head. Drop until valid opener.
+    # Phase 2: repair the head.
     while tail and not _is_valid_opener(tail[0]):
         tail = tail[1:]
 
-    return tail
+    # Phase 3: collapse same-role runs.
+    return _collapse_consecutive_same_role(tail)
 
 
 class HistoryStore:
@@ -111,61 +168,21 @@ class HistoryStore:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._data: dict[str, list[dict[str, Any]]] = self._load()
-
-    def _load(self) -> dict[str, list[dict[str, Any]]]:
-        if not self.path.exists():
-            log.info("No history file at %s — starting empty.", self.path)
-            return {}
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                raise ValueError("history file is not a JSON object")
-            log.info("Loaded history for %d chat(s) from %s",
-                     len(data), self.path)
-            return data
-        except (json.JSONDecodeError, ValueError, OSError) as e:
-            # Do not crash — a broken history file is annoying, not fatal.
-            # Rename the broken file aside so the next _save() (which uses
-            # os.replace) cannot destroy it. The user (or future audit
-            # tooling) can inspect what went wrong.
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            preserved = self.path.with_name(f"{self.path.name}.corrupt.{ts}")
-            try:
-                os.rename(self.path, preserved)
-                log.warning(
-                    "History file at %s is unusable (%s). Preserved as %s. "
-                    "Starting empty.",
-                    self.path, e, preserved,
-                )
-            except OSError as rename_err:
-                log.warning(
-                    "History file at %s is unusable (%s) and could not be "
-                    "preserved (%s). Starting empty; the broken file will "
-                    "be overwritten on the next save.",
-                    self.path, e, rename_err,
-                )
-            return {}
+        self._data: dict[str, list[dict[str, Any]]] = json_store.load_json_dict(
+            self.path, log,
+        )
+        log.info("Loaded history for %d chat(s) from %s",
+                 len(self._data), self.path)
 
     def _save(self) -> None:
-        # Atomic in the sense that no reader ever sees a half-written
-        # file. NOT durable across power loss (no fsync). Fine at this
-        # scale; noted for future reference.
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(_to_plain(self._data), ensure_ascii=False),
-            encoding="utf-8",
-        )
-        os.replace(tmp, self.path)
+        json_store.save_json_dict_atomic(self.path, self._data)
 
     def get(self, chat_id: int) -> list[dict[str, Any]]:
         """Return the message list for a chat.
 
-        Returns a SHALLOW copy of the outer list. Appending to it does
-        not affect the store until set() is called (fine — brain.think
-        only appends). Mutating a nested dict WOULD affect the stored
-        version; callers must not do that.
+        SHALLOW copy of the outer list — appending is safe (brain.think
+        only appends), but mutating a nested dict WILL affect stored
+        state. Callers append; they do not mutate.
         """
         return list(self._data.get(str(chat_id), []))
 
@@ -173,9 +190,7 @@ class HistoryStore:
         """Replace the history for a chat and persist to disk (trimmed).
 
         Trim happens BEFORE save so the on-disk file never carries what
-        the next request wouldn't include anyway. The trim is structure-
-        aware — see _trim().
+        the next request wouldn't include anyway.
         """
-        trimmed = _trim(messages)
-        self._data[str(chat_id)] = trimmed
+        self._data[str(chat_id)] = _trim(messages)
         self._save()

@@ -5,19 +5,31 @@ Flow for one user message:
     1. Add the message to the conversation history.
     2. Send history + tool definitions to the Claude API.
     3. If Claude replies with text -> done, return it.
-    4. If Claude asks to use a tool -> run it (via vault.py), append the
-       result to the history, and go back to step 2.
+    4. If Claude asks to use a tool -> run it, append the result to
+       history, go back to step 2.
 
-Step 2-4 is "the agent loop". Rung 1's tools are read-only-ish (list,
-read, append, create) so no approval step yet — that arrives the moment
-a tool has consequences outside the vault.
+Step 2-4 is "the agent loop". Two families of tools:
+
+  * Read-only-ish (list, read, append, create, edit_section, update_memory,
+    append_to_inbox): touch only Chad's own vault. Run inline.
+  * Side-effecting (add_reminder and everything future): NEVER run
+    inline. Chad calls propose_action(kind, args); the proposal queues;
+    the callback in bot.py fires the executor after the human approves
+    it via a Telegram button. See chad/proposals.py for the gates.
+
+The typed-yes / approve_pending path from the original design has been
+temporarily removed from the tool schema — the M2 review showed it
+could bypass approval within a single turn. Yes-only-via-button until
+the gates are re-verified for the typed path.
 """
 
 from datetime import datetime
 
 import anthropic
 
-from chad import config, memory, vault
+from chad import config, memory, proposals, vault
+# Imported for side effect: registers add_reminder as a proposal executor.
+from chad import reminders  # noqa: F401
 
 BASE_SYSTEM_PROMPT = """You are Chad, a personal assistant for your user, \
 whom you talk to over Telegram. Your memory is an Obsidian vault of markdown \
@@ -53,16 +65,32 @@ location), Preferences for how you should behave, Ongoing for current \
 courses / projects / shifts, Decisions for conclusions with dates, \
 Archive for pointers to older material. When the user contradicts \
 memory, update the section — do not stack duplicates.
+
+APPROVALS:
+You NEVER execute a side-effecting action directly. Any action that \
+affects the outside world (setting a reminder, adding a calendar event, \
+sending a draft, ...) MUST go through propose_action. The user sees a \
+Yes / Edit / No preview and approves before anything runs.\n\
+When <pending_approvals> appears in your context, those are proposals \
+already shown to the user. If the user replies "yes" / "do it" / "no" / \
+"skip", tell them to use the Yes/No buttons on the proposal message — \
+you cannot approve or reject on their behalf. Do NOT restate a queued \
+proposal as if it hasn't been shown; the user is looking at buttons. \
+If they ask to change something ("actually make it Friday"), propose_action \
+again with the corrected args — the old proposal will expire.
 """
 
 
-def _build_system_prompt() -> str:
-    """Assemble the system prompt with current memory + vault map injected.
+def _build_system_prompt(chat_id: int | None = None) -> str:
+    """Assemble the system prompt with current memory + vault map + pending approvals.
 
-    Both files are optional — if they don't exist, we tell Chad so it
-    knows to create them when the user first shares something worth
-    remembering. Reading them from disk each request means edits made
-    during one message are visible in the next, no restart needed.
+    All three sources are optional. Missing memory.md is a bug (bootstrap
+    should have created it); missing map.md is expected until M10; no
+    pending approvals is the common case.
+
+    Reading fresh from disk each request means writes made in one
+    message are visible in the next, no restart or cache invalidation.
+    (Cost of these reads is what M8's prompt caching addresses.)
     """
     parts = [BASE_SYSTEM_PROMPT]
 
@@ -92,6 +120,22 @@ def _build_system_prompt() -> str:
         parts.append(f"\n---\nCURRENT map.md (vault geography):\n\n{vault_map}")
     except vault.VaultError:
         pass  # No map yet — Chad falls back to list_notes.
+
+    # Pending / editing approvals: shown to the model so it knows the
+    # user is looking at buttons and doesn't repropose. Includes the
+    # editing state (M2 in the review) so an in-progress edit isn't
+    # invisible during the follow-up message.
+    if chat_id is not None:
+        visible = proposals.STORE.visible_for_chat(chat_id)
+        if visible:
+            lines = "\n".join(
+                f"  [{p['status']}] {p['pid']}: {p['summary']}"
+                for p in visible
+            )
+            parts.append(
+                "\n---\n<pending_approvals>\n" + lines +
+                "\n</pending_approvals>"
+            )
 
     return "".join(parts)
 
@@ -188,6 +232,35 @@ TOOLS = [
         },
     },
     {
+        "name": "propose_action",
+        "description": "Propose a side-effecting action. NEVER execute "
+                       "side-effecting actions directly — always propose. "
+                       "The user sees a Yes / Edit / No button message and "
+                       "only your action runs on Yes.\n\n"
+                       "Currently supported kinds:\n"
+                       "  - add_reminder: args = {date: 'YYYY-MM-DD', text: str}\n\n"
+                       "The user-visible preview is rendered server-side "
+                       "from your args — you do NOT supply it. Bad args are "
+                       "rejected before the user sees anything, so if "
+                       "propose_action fails with a validation error, fix "
+                       "the args and try again.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["add_reminder"],
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Kind-specific arguments — see the "
+                                   "description for each supported kind.",
+                },
+            },
+            "required": ["kind", "args"],
+        },
+    },
+    {
         "name": "update_memory",
         "description": "Update a section of memory.md — the persistent "
                        "memory that's injected into your system prompt every "
@@ -222,8 +295,12 @@ TOOLS = [
 _client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
 
-def _run_tool(name: str, args: dict) -> str:
-    """Execute one tool call. Errors become strings the model can read."""
+def _run_tool(name: str, args: dict, chat_id: int) -> str:
+    """Execute one tool call. Errors become strings the model can read.
+
+    chat_id is needed by tools that queue work per-conversation (propose_action).
+    Tools that don't need it just ignore the parameter.
+    """
     try:
         if name == "list_notes":
             notes = vault.list_notes(args.get("folder", ""))
@@ -242,6 +319,13 @@ def _run_tool(name: str, args: dict) -> str:
             )
         if name == "update_memory":
             return memory.write_section(args["section"], args["new_body"])
+        if name == "propose_action":
+            # Validation and summary derivation happen inside .add(); a
+            # bad args dict raises here and the human never sees a
+            # bogus preview.
+            pid = proposals.STORE.add(args["kind"], args["args"], chat_id)
+            return (f"Proposal {pid} queued. A button message will appear "
+                    f"for the user; wait for their tap.")
         return f"Unknown tool: {name}"
     except vault.VaultError as e:
         return f"Error: {e}"
@@ -249,18 +333,28 @@ def _run_tool(name: str, args: dict) -> str:
         # Distinct from generic errors — the model should tell the user
         # consolidation is needed, not just retry.
         return f"CAP_EXCEEDED: {e}"
+    except proposals.ProposalError as e:
+        return f"Error: {e}"
+    except (KeyError, ValueError, TypeError) as e:
+        # Bad executor args, missing keys, wrong types.
+        return f"Error: {e}"
 
 
-def think(history: list[dict], user_message: str) -> str:
+def think(history: list[dict], user_message: str, chat_id: int) -> str:
     """Run one full agent loop. Mutates `history` in place so the caller
-    keeps conversational memory between messages."""
+    keeps conversational memory between messages.
+
+    chat_id is used to (a) inject that chat's pending approvals into the
+    system prompt, and (b) tag any propose_action calls with the chat
+    they belong to.
+    """
     history.append({"role": "user", "content": user_message})
 
     while True:
         response = _client.messages.create(
             model=config.MODEL,
             max_tokens=1024,
-            system=_build_system_prompt(),
+            system=_build_system_prompt(chat_id),
             tools=TOOLS,
             messages=history,
         )
@@ -277,7 +371,7 @@ def think(history: list[dict], user_message: str) -> str:
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                output = _run_tool(block.name, block.input)
+                output = _run_tool(block.name, block.input, chat_id)
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
