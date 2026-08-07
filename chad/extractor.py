@@ -218,6 +218,14 @@ def _content_shape_error(content: object) -> str | None:
         return "multi-line (would inject a second heading)"
     if content.lstrip().startswith("#"):
         return "heading-shaped (would inject a second heading)"
+    if content.lstrip().startswith("["):
+        # Chad's own internal markers use this shape:
+        # "[approved proposal ...]", "[rejected ...]", "[editing ...]".
+        # Not reachable today (extractor only sees new user turns), but
+        # would become reachable the moment anything backfills from
+        # stored history — a consolidation job, a re-extract utility.
+        # Cheap to refuse the shape entirely here.
+        return "bracketed (looks like an internal marker)"
     if len(content) > MAX_CONTENT_CHARS:
         return f"oversized ({len(content)} > {MAX_CONTENT_CHARS} chars)"
     return None
