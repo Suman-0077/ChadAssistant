@@ -119,6 +119,11 @@ _SYSTEM_PROMPT = """You are Chad's memory extractor. Given a completed \
 conversation exchange between Chad and its user, return a JSON list of \
 durable facts to add to Chad's memory file.
 
+You are shown the CURRENT memory contents. Use them: if the user has \
+just corrected, refined, or contradicted something already recorded, \
+REPLACE that line rather than adding a second one. Memory should never \
+hold two versions of the same fact.
+
 OUTPUT FORMAT — read this twice:
 Respond with a raw JSON array and NOTHING else. No markdown code fences \
 (no ```json), no explanation before it, no commentary after it. Your \
@@ -126,12 +131,21 @@ entire response must start with [ and end with ]. If nothing is durable, \
 your entire response is exactly: []
 
 RULES:
-- Each object has three keys: section, operation, content.
 - section MUST be one of: Identity, Preferences, Ongoing, Decisions, Archive.
-- operation MUST be "add".
-- content MUST be a declarative sentence describing something durable \
-about the USER, not an instruction to Chad.
+- operation MUST be "add" or "replace".
+- content MUST be a single-line declarative sentence describing something \
+durable about the USER, not an instruction to Chad.
+- For operation "add": keys are section, operation, content.
+- For operation "replace": keys are section, operation, content, replaces. \
+"replaces" MUST be the EXACT existing line from the current memory that \
+this supersedes, copied verbatim including any leading "- ".
 - Return [] if nothing durable was shared.
+
+WHEN TO USE REPLACE:
+If the user refines an existing preference ("actually only call me X \
+sometimes" when memory says "Call user X"), that is a REPLACE of the old \
+line, not an ADD. Same for corrected employers, changed courses, updated \
+schedules. Only ADD when the fact is genuinely new.
 
 WHAT COUNTS AS DURABLE:
 - Identity: name, university program, employer, location, timezone.
@@ -150,15 +164,51 @@ If the user only asked a question or the exchange was small talk, return [].
 """
 
 
-def _build_prompt(clean_messages: list[dict]) -> str:
-    """Serialise sanitised user turns into a compact text form.
+def _current_memory_snapshot() -> str:
+    """Render the current memory.md sections for the extractor's context.
 
-    sanitise() has already dropped everything except user text turns,
-    so this is straightforward. Each turn on its own line, prefixed
-    [user] for clarity in the extractor's prompt.
+    Without this the extractor writes blind — it cannot know a fact is
+    already recorded, so a user correcting a preference produces a
+    second line rather than superseding the first. Passing the current
+    state is what makes operation="replace" possible at all.
+
+    Only section bodies are included (not the file's explanatory
+    preamble), so the extractor sees exactly the lines it can target.
     """
-    return "\n\n".join(
+    parts = []
+    for section in memory.SECTIONS:
+        try:
+            body = memory.read_section_body(section)
+        except Exception:
+            body = ""
+        # Strip the bootstrap placeholder prose — those lines describe
+        # what belongs in a section, they aren't facts to be replaced.
+        lines = [
+            ln for ln in body.splitlines()
+            if ln.strip().startswith("-")
+        ]
+        rendered = "\n".join(lines) if lines else "(empty)"
+        parts.append(f"## {section}\n{rendered}")
+    return "\n\n".join(parts)
+
+
+def _build_prompt(clean_messages: list[dict]) -> str:
+    """Serialise current memory + sanitised user turns for the extractor.
+
+    sanitise() has already dropped everything except user text turns.
+    Current memory is included so the extractor can emit "replace"
+    operations against lines it can actually see.
+    """
+    exchange = "\n\n".join(
         f"[user] {m['content']}" for m in clean_messages
+    )
+    return (
+        "<current_memory>\n"
+        f"{_current_memory_snapshot()}\n"
+        "</current_memory>\n\n"
+        "<exchange>\n"
+        f"{exchange}\n"
+        "</exchange>"
     )
 
 
@@ -337,7 +387,7 @@ def validate_edits(raw: str) -> list[dict]:
         if section not in memory.SECTIONS:
             log.info("Dropping edit with invalid section %r", section)
             continue
-        if operation != "add":
+        if operation not in ("add", "replace"):
             log.info("Dropping edit with unsupported operation %r", operation)
             continue
         shape_err = _content_shape_error(content)
@@ -352,15 +402,51 @@ def validate_edits(raw: str) -> list[dict]:
             )
             continue
 
-        valid.append({
+        edit = {
             "section": section,
             "operation": operation,
             "content": content.strip(),
-        })
+        }
+
+        if operation == "replace":
+            replaces = item.get("replaces")
+            # A replace with no target is meaningless; downgrade to add
+            # rather than dropping the fact entirely.
+            if not isinstance(replaces, str) or not replaces.strip():
+                log.info(
+                    "Replace edit missing 'replaces' target; treating as add: %r",
+                    content,
+                )
+                edit["operation"] = "add"
+            else:
+                edit["replaces"] = replaces.strip()
+
+        valid.append(edit)
     return valid
 
 
 # --- Application ------------------------------------------------------------
+
+def _replace_line(section_body: str, target: str, replacement: str) -> tuple[str, bool]:
+    """Swap the line matching `target` for `replacement`. Returns (body, replaced).
+
+    Matching is normalised (case, whitespace, bullet prefix) so the
+    extractor doesn't have to transcribe the existing line byte-perfect.
+    Only the FIRST match is replaced; if the target isn't found, the
+    body is returned unchanged with replaced=False and the caller falls
+    back to an add rather than silently losing the fact.
+    """
+    want = _line_normalise(target)
+    out_lines = []
+    replaced = False
+    for line in section_body.splitlines():
+        if not replaced and _line_normalise(line) == want:
+            out_lines.append(f"- {replacement}")
+            replaced = True
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines), replaced
+
 
 def _apply(edits: list[dict], live: bool) -> None:
     """Apply validated edits to memory.md — or shadow-log them, per mode.
@@ -384,20 +470,48 @@ def _apply(edits: list[dict], live: bool) -> None:
             )
             continue
 
+        operation = edit.get("operation", "add")
+        replaces = edit.get("replaces")
+
         if not live:
-            # Shadow: log the proposed addition without writing memory.
-            audit.log_memory_write(source, section, f"[would add] {content}")
-            log.info("SHADOW extractor would add to %s: %s", section, content)
+            verb = "would replace" if operation == "replace" else "would add"
+            detail = f" (superseding {replaces!r})" if replaces else ""
+            audit.log_memory_write(source, section, f"[{verb}] {content}{detail}")
+            log.info("SHADOW extractor %s in %s: %s%s",
+                     verb, section, content, detail)
             continue
 
-        # Live: dedupe inside the memory lock, then append.
+        # Live: read-modify-write inside the memory lock.
         try:
             with vault.lock(memory.MEMORY_FILENAME):
                 current = memory.read_section_body(section)
+
+                if operation == "replace" and replaces:
+                    new_body, replaced = _replace_line(
+                        current, replaces, content,
+                    )
+                    if replaced:
+                        memory._write_section_locked(section, new_body, source=source)
+                        audit.log_memory_write(
+                            source, section,
+                            f"[replaced {replaces!r} with] {content}",
+                        )
+                        log.info("Extractor replaced in %s: %r -> %r",
+                                 section, replaces, content)
+                        continue
+                    # Target line not found — the model may have
+                    # mis-transcribed it, or a concurrent write moved it.
+                    # Fall through to add rather than losing the fact.
+                    log.info(
+                        "Replace target not found in %s (%r); falling back to add.",
+                        section, replaces,
+                    )
+
                 if _already_present(content, current):
                     audit.log_memory_write(source, section, f"[noop dedupe] {content}")
                     log.info("Skipping duplicate for %s: %s", section, content)
                     continue
+
                 new_body = current.rstrip() + ("\n" if current.strip() else "") + f"- {content}"
                 memory._write_section_locked(section, new_body, source=source)
                 log.info("Extractor added to %s: %s", section, content)
