@@ -113,7 +113,7 @@ def main() -> int:
             for e in edits:
                 print(f"  VALID   [{e['section']}] {e['content']}")
         else:
-            print(f"  VALID   (none)")
+            print("  VALID   (none)")
 
         n = len(edits)
         ok = lo <= n <= hi

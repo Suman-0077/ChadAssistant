@@ -127,7 +127,6 @@ def _merge_blocks(first: Any, second: Any) -> list[dict]:
     rest = [b for b in blocks
             if not (isinstance(b, dict) and b.get("type") == "tool_result")]
     return tool_results + rest
-    return str(content)
 
 
 def _trim(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
