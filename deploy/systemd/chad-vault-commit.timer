@@ -1,0 +1,15 @@
+[Unit]
+Description=Commit vault changes to git every 15 minutes
+
+[Timer]
+# Every 15 minutes, starting 2 minutes after boot. Frequent enough that
+# a diff maps to roughly one working session; infrequent enough that
+# git log stays readable.
+OnBootSec=2min
+OnUnitActiveSec=15min
+# Catch up after downtime rather than skipping the window entirely.
+Persistent=true
+Unit=chad-vault-commit.service
+
+[Install]
+WantedBy=timers.target

@@ -204,20 +204,57 @@ def append_to_inbox(text: str) -> str:
 _HEADING_RE = re.compile(r"^(#+)\s+(.+?)\s*$")
 
 
+# How long to keep pre-edit backups. Git auto-commit (chad.cron.vault_commit)
+# now holds the full history, so .chad-backups/ is a short-window
+# convenience for "undo the thing that just happened" rather than an
+# archive. 30 days is generous for that purpose.
+BACKUP_RETENTION_DAYS = 30
+
+BACKUP_DIR = config.VAULT_PATH / ".chad-backups"
+
+
+def prune_backups(retention_days: int = BACKUP_RETENTION_DAYS) -> int:
+    """Delete backups older than retention_days. Returns the count removed.
+
+    Called opportunistically from _backup rather than on a timer — the
+    work is trivial and it keeps the pruning next to the thing that
+    creates the files. Never raises: failing to prune must not fail a
+    real write.
+    """
+    if not BACKUP_DIR.is_dir():
+        return 0
+    cutoff = datetime.now(timezone.utc).timestamp() - retention_days * 86400
+    removed = 0
+    try:
+        for f in BACKUP_DIR.glob("*.bak"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                continue  # file vanished or is locked; skip
+    except OSError:
+        return removed
+    return removed
+
+
 def _backup(path: Path) -> None:
     """Save a timestamped copy of a note before modifying it.
 
     Backups live in .chad-backups/ inside the vault. The folder starts
-    with a dot so list_notes() skips it, and Obsidian typically hides
-    dot-folders too. Once git auto-commit is set up this becomes a
-    belt-and-suspenders redundancy, which is fine.
+    with a dot so list_notes() skips it, _safe_path refuses it, and
+    Obsidian hides it. Git auto-commit holds the durable history; these
+    are the short-window undo buffer, pruned to 30 days.
     """
-    backup_dir = config.VAULT_PATH / ".chad-backups"
-    backup_dir.mkdir(exist_ok=True)
+    BACKUP_DIR.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     rel = path.relative_to(config.VAULT_PATH).as_posix().replace("/", "__")
-    backup_path = backup_dir / f"{rel}.{ts}.bak"
+    backup_path = BACKUP_DIR / f"{rel}.{ts}.bak"
     backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # Opportunistic prune. Cheap (a glob + stat per file), and keeps the
+    # folder bounded without needing its own timer.
+    prune_backups()
 
 
 def compute_section_edit(text: str, section_heading: str, new_body: str) -> str:

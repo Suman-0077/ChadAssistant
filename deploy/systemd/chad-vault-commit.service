@@ -1,0 +1,17 @@
+[Unit]
+Description=Chad vault auto-commit — snapshot the vault into git as an audit trail
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/chad
+ExecStart=/root/chad/.venv/bin/python -m chad.cron.vault_commit
+User=root
+
+# Sandboxing — needs the vault (read-write) and the venv. No network at all.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/vault
